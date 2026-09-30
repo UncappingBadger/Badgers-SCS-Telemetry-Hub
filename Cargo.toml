@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["plugin"]
+
+[profile.release]
+opt-level = "s"
+# Deliberately NOT panic = "abort": scs-sdk-plugin's framework catches panics at the
+# FFI boundary (its "panic containment" feature) so one bad callback can't kill the
+# whole game process - aborting here would bypass that safety net entirely.

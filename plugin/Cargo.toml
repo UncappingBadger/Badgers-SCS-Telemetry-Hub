@@ -1,0 +1,15 @@
+[package]
+name = "scs_telemetry_hub"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Independent SCS Telemetry SDK plugin that republishes live ETS2/ATS telemetry as JSON over a local HTTP/SSE server."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+scs-sdk-plugin = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"

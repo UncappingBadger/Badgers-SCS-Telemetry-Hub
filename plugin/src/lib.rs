@@ -1,0 +1,1185 @@
+//! Independent SCS Telemetry SDK plugin for ETS2/ATS.
+//!
+//! Reads live telemetry via `scs-sdk-plugin` (an actively-maintained, safe Rust
+//! framework over SCS Software's official Telemetry SDK 1.14 - see
+//! https://github.com/AptS-1547/scs-sdk-crates) and republishes it as plain JSON
+//! over a local HTTP server, instead of a fixed-layout shared-memory struct.
+//! That deliberately decouples every future consumer from a binary ABI: any
+//! language/tool can read `GET /snapshot` or subscribe to `GET /stream`
+//! (Server-Sent Events) without needing a matching struct definition.
+//!
+//! Callbacks below run synchronously on the game's own telemetry thread (see
+//! the upstream example's own note on this), so nothing here may block. All
+//! callback work is therefore limited to cheap in-memory updates and a
+//! non-blocking `mpsc::Sender::send` to broadcast to already-connected HTTP
+//! clients; the actual HTTP server runs on its own thread, spawned once.
+
+use std::io::{self, Read};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use scs_sdk_plugin::sdk::{
+    Attribute, GameSchemaAvailability, StringValue, TelemetryApiVersion, channels, configuration,
+    game, gameplay,
+};
+use scs_sdk_plugin::{
+    ChannelUpdate, ConfigurationEvent, Game, GameCompatibility, GameplayEvent, PluginCompatibility,
+    PluginContext, PluginMetadata, PluginResult, TelemetryEvent, TelemetryEventKind,
+    TelemetryPlugin, export_plugin,
+};
+use serde::Serialize;
+
+/// Loopback-only by design - this is a local bridge for other processes on the
+/// same machine (a future TruckHub, a debug curl session, etc.), never a
+/// network service.
+const LISTEN_ADDRESS: &str = "127.0.0.1:38471";
+
+/// Snapshot broadcasts are throttled to this interval so a live `/stream`
+/// consumer gets smooth updates without flooding on every single frame -
+/// matches roughly what a HUD actually needs to redraw at, well under what a
+/// human can perceive as choppy.
+const SNAPSHOT_INTERVAL_MICROSECONDS: u64 = 100_000; // 10 Hz
+
+static SUPPORTED_GAMES: [GameCompatibility; 2] = [
+    GameCompatibility::new(Game::EuroTruckSimulator2, game::ets2::V1_00),
+    GameCompatibility::new(Game::AmericanTruckSimulator, game::ats::V1_00),
+];
+
+#[derive(Serialize, Default, Clone, Copy, Debug)]
+struct Vec3 {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+#[derive(Serialize, Default, Clone, Copy, Debug)]
+struct Orientation {
+    heading: f32,
+    pitch: f32,
+    roll: f32,
+}
+
+#[derive(Serialize, Default, Clone, Copy, Debug)]
+struct Placement {
+    position: Vec3,
+    orientation: Orientation,
+}
+
+/// Everything read from the `truck` static-specs configuration - fetched once
+/// (re-sent by SCS whenever the truck/trailer setup changes) rather than
+/// polled every frame, since none of it changes mid-drive.
+#[derive(Serialize, Default, Clone, Debug)]
+struct TruckSpec {
+    brand_id: String,
+    brand: String,
+    id: String,
+    name: String,
+    license_plate: String,
+    license_plate_country: String,
+    fuel_capacity_liters: f32,
+    fuel_warning_factor: f32,
+    adblue_capacity_liters: f32,
+    adblue_warning_factor: f32,
+    rpm_limit: f32,
+    forward_gear_count: u32,
+    reverse_gear_count: u32,
+    retarder_step_count: u32,
+    /// Static per-wheel capability flags - distinct from the live per-wheel
+    /// state in `Snapshot.truck_wheels`. Sized to whatever `WHEEL_COUNT`
+    /// actually reports, not `MAX_WHEEL_INDEX` - TruckHub's EXT suspension
+    /// readout uses these to label an axle (fixed tag vs. drive vs. steer)
+    /// rather than to plot a live reading.
+    wheel_steerable: Vec<bool>,
+    wheel_powered: Vec<bool>,
+    wheel_liftable: Vec<bool>,
+    /// From the separate `controls` configuration, not `truck` - merged into
+    /// this struct anyway since it's static per-vehicle info like everything
+    /// else here. One of "arcade"/"automatic"/"manual"/"hshifter" - kept as
+    /// the raw SDK string rather than only a parsed enum, same reasoning as
+    /// `JobInfo::job_market_raw`.
+    shifter_type: String,
+}
+
+/// Static per-trailer info from the `trailer` configuration - name and
+/// per-wheel liftable flags, the trailer-side counterparts to `TruckSpec`'s
+/// fields above (trailers have no steerable/powered wheels at all, so there's
+/// nothing to decode for those two here).
+#[derive(Serialize, Default, Clone, Debug)]
+struct TrailerSpec {
+    name: String,
+    wheel_liftable: Vec<bool>,
+}
+
+/// Everything read from the `job` configuration for whatever job is currently
+/// active (freight or, once SCS publishes it, anything else that reuses this
+/// same configuration id).
+#[derive(Serialize, Default, Clone, Debug)]
+struct JobInfo {
+    active: bool,
+    /// Raw configuration id this job came from - `"job"` for classic freight,
+    /// `"car_job"` for a Road Trip DLC Quick Job, `"bus_job"` for ETS2's
+    /// Coaches DLC. Kept as the literal SDK string rather than an enum since
+    /// this build's typed catalog (audited against SDK 1.14, which predates
+    /// all three of these being distinguished) has no constant for the last
+    /// two - see `handle_configuration`'s doc comment for how this was found.
+    source_kind: String,
+    cargo: String,
+    cargo_id: String,
+    cargo_mass_kg: f32,
+    source_city: String,
+    source_city_id: String,
+    source_company: String,
+    source_company_id: String,
+    destination_city: String,
+    destination_city_id: String,
+    destination_company: String,
+    destination_company_id: String,
+    income: u64,
+    delivery_time_seconds: u32,
+    planned_distance_km: u32,
+    cargo_loaded: bool,
+    special_job: bool,
+    /// Raw SDK string, kept alongside `job_market_known` on purpose - see
+    /// `handle_configuration`'s doc comment for why this must never be
+    /// collapsed down to only the typed enum.
+    job_market_raw: String,
+    job_market_known: Option<String>,
+}
+
+/// One physical wheel position's live state (suspension, contact, rotation).
+/// Truck and trailer each keep their own `Vec<WheelState>`, grown on demand
+/// as indexed channel updates arrive (see `ensure_wheel_len`) rather than
+/// pre-sized to a fixed count - a car has fewer wheel positions than a truck
+/// with a tag axle, and a short trailer has fewer than a tridem one, so a
+/// fixed-size array would either truncate a real rig or pad a car's output
+/// with meaningless zero entries.
+#[derive(Serialize, Default, Clone, Copy, Debug)]
+struct WheelState {
+    suspension_deflection: f32,
+    on_ground: bool,
+    substance: u32,
+    velocity: f32,
+    steering: f32,
+    rotation: f32,
+    lift: f32,
+    lift_offset: f32,
+}
+
+/// Every subscription in `initialize` for wheel-indexed channels loops up to
+/// this many indices using `subscribe_at_optional`, which silently skips any
+/// index a specific vehicle doesn't actually have - see that call site for
+/// why this can't instead be sized exactly once the real count is known
+/// (subscribing is only valid during `initialize`, before any configuration
+/// event has told us how many wheels this vehicle has). 24 comfortably covers
+/// any real ATS/ETS2 truck+trailer combination, including multi-axle
+/// oversize-load trailers.
+const MAX_WHEEL_INDEX: u32 = 24;
+
+/// One H-shifter gear-slot mapping, decoded from the `hshifter` configuration.
+#[derive(Serialize, Clone, Debug)]
+struct HshifterSlot {
+    slot: u32,
+    gear: i32,
+    handle_position: u32,
+    selectors: u32,
+}
+
+#[derive(Serialize, Default, Clone, Debug)]
+struct HshifterInfo {
+    selector_count: u32,
+    slots: Vec<HshifterSlot>,
+}
+
+#[derive(Serialize, Default, Clone, Debug)]
+struct TrailerState {
+    connected: bool,
+    cargo_damage: f32,
+    placement: Placement,
+    wear_body: f32,
+    wear_chassis: f32,
+    wear_wheels: f32,
+    wheels: Vec<WheelState>,
+}
+
+/// The live, frequently-changing part of the state - one field per subscribed
+/// channel. Numeric fields default to zero/false rather than `Option` because
+/// SCS channels report "no value" as an SDK-level absence handled by
+/// `ChannelUpdate::value` already (see `handle_channel`) - once a value has
+/// ever arrived it stays meaningful for the rest of the session, matching the
+/// upstream example's own "leave the previous field unchanged" approach.
+#[derive(Serialize, Default, Clone, Debug)]
+struct Snapshot {
+    game_paused: bool,
+    placement: Placement,
+    speed_mps: f32,
+    engine_rpm: f32,
+    engine_gear: i32,
+    displayed_gear: i32,
+    cruise_control_mps: f32,
+    parking_brake: bool,
+    motor_brake: bool,
+    retarder_level: u32,
+    brake_air_pressure: f32,
+    brake_air_pressure_warning: bool,
+    brake_air_pressure_emergency: bool,
+    brake_temperature: f32,
+    fuel_liters: f32,
+    fuel_warning: bool,
+    fuel_average_consumption: f32,
+    fuel_range_km: f32,
+    adblue_liters: f32,
+    adblue_warning: bool,
+    adblue_average_consumption: f32,
+    oil_pressure: f32,
+    oil_pressure_warning: bool,
+    oil_temperature: f32,
+    water_temperature: f32,
+    water_temperature_warning: bool,
+    battery_voltage: f32,
+    battery_voltage_warning: bool,
+    electric_enabled: bool,
+    engine_enabled: bool,
+    light_lblinker: bool,
+    light_rblinker: bool,
+    hazard_warning: bool,
+    light_parking: bool,
+    light_low_beam: bool,
+    light_high_beam: bool,
+    light_beacon: bool,
+    light_brake: bool,
+    light_reverse: bool,
+    differential_lock: bool,
+    lift_axle: bool,
+    lift_axle_indicator: bool,
+    trailer_lift_axle: bool,
+    trailer_lift_axle_indicator: bool,
+    wear_engine: f32,
+    wear_transmission: f32,
+    wear_cabin: f32,
+    wear_chassis: f32,
+    wear_wheels: f32,
+    odometer_km: f32,
+    navigation_distance_m: f32,
+    navigation_time_s: f32,
+    navigation_speed_limit_mps: f32,
+    truck_wheels: Vec<WheelState>,
+    /// Current physical H-shifter slot - what Ctrl+Alt+G-style calibration
+    /// actually captures (distinct from the `hshifter` configuration's static
+    /// slot->gear mapping, decoded separately into `HshifterInfo`).
+    hshifter_slot: u32,
+    /// Selector toggle states, indexed 0=splitter, 1=range (matching
+    /// TruckHub's own already-calibrated convention) - grown on demand like
+    /// the wheel vecs, since a gearbox with no splitter/range never delivers
+    /// index 1 at all.
+    hshifter_selectors: Vec<bool>,
+    trailer: TrailerState,
+    game_time_minutes: u32,
+    next_rest_stop_minutes: i32,
+    multiplayer_time_offset_minutes: i32,
+}
+
+/// Shared, cheaply-cloneable handles that outlive any single callback - the
+/// HTTP thread(s) and the SDK callback thread both hold these.
+#[derive(Clone)]
+struct Shared {
+    snapshot: Arc<Mutex<Snapshot>>,
+    truck_spec: Arc<Mutex<TruckSpec>>,
+    trailer_spec: Arc<Mutex<TrailerSpec>>,
+    hshifter: Arc<Mutex<HshifterInfo>>,
+    job: Arc<Mutex<JobInfo>>,
+    /// One sender per currently-open `/stream` connection. `broadcast` drops
+    /// any sender whose receiver has already hung up instead of erroring,
+    /// since HTTP clients disconnect at arbitrary times.
+    subscribers: Arc<Mutex<Vec<mpsc::Sender<String>>>>,
+    game_display_name: Arc<Mutex<String>>,
+    /// Count of HTTP connections currently being handled, each on its own
+    /// thread living inside this game process (see spawn_http_server) - capped
+    /// at MAX_HTTP_CONNECTIONS so a runaway/reconnecting client can't grow
+    /// threads unboundedly inside the host process.
+    active_connections: Arc<AtomicUsize>,
+}
+
+/// Hard cap on concurrent HTTP connections (each backed by its own OS thread
+/// inside the game process). Generous for the real use case - one TruckHub
+/// client holding a single long-lived `/stream` connection, plus occasional
+/// one-shot `/snapshot` requests - while still bounding worst-case thread
+/// growth from a misbehaving client.
+const MAX_HTTP_CONNECTIONS: usize = 32;
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            snapshot: Arc::new(Mutex::new(Snapshot::default())),
+            truck_spec: Arc::new(Mutex::new(TruckSpec::default())),
+            trailer_spec: Arc::new(Mutex::new(TrailerSpec::default())),
+            hshifter: Arc::new(Mutex::new(HshifterInfo::default())),
+            job: Arc::new(Mutex::new(JobInfo::default())),
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+            game_display_name: Arc::new(Mutex::new(String::new())),
+            active_connections: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Sends one already-serialized JSON line to every open `/stream`
+    /// connection. Called from the SDK callback thread, so this must stay
+    /// non-blocking: `mpsc::Sender::send` only pushes onto an unbounded queue,
+    /// it never waits on the receiving HTTP thread.
+    fn broadcast(&self, message: &str) {
+        let mut subs = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        subs.retain(|tx| tx.send(message.to_string()).is_ok());
+    }
+
+    fn full_state_json(&self) -> serde_json::Value {
+        let snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let truck_spec = self.truck_spec.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let trailer_spec = self.trailer_spec.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let hshifter = self.hshifter.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let job = self.job.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let game_display_name = self
+            .game_display_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        serde_json::json!({
+            "type": "snapshot",
+            "game": game_display_name,
+            "truck_spec": truck_spec,
+            "trailer_spec": trailer_spec,
+            "hshifter": hshifter,
+            "job": job,
+            "data": snapshot,
+        })
+    }
+}
+
+/// Reads chunk-by-chunk from an `mpsc::Receiver<String>`, formatting each
+/// message as a Server-Sent Event. Blocks on `recv()` between messages - the
+/// dedicated thread this runs on has nothing else to do while a `/stream`
+/// connection is open, so blocking here is correct, not a bug.
+struct SseBody {
+    rx: mpsc::Receiver<String>,
+    pending: Vec<u8>,
+}
+
+impl Read for SseBody {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pending.is_empty() {
+            match self.rx.recv() {
+                Ok(message) => self.pending = format!("data: {message}\n\n").into_bytes(),
+                Err(_) => return Ok(0), // sender side dropped -> plugin shut down, end the stream
+            }
+        }
+        let n = out.len().min(self.pending.len());
+        out[..n].copy_from_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        Ok(n)
+    }
+}
+
+/// Decrements `active_connections` when dropped, so the count is released on
+/// every exit path out of the request-handling thread - normal completion,
+/// an early return, or a panic unwinding the thread - without needing a
+/// matching decrement at each one individually.
+struct ConnectionGuard(Arc<AtomicUsize>);
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn handle_request(request: tiny_http::Request, shared: &Shared) {
+    let response_result = match (request.method(), request.url()) {
+        (tiny_http::Method::Get, "/snapshot") => {
+            let body = shared.full_state_json().to_string();
+            request.respond(
+                tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .expect("static header is always valid"),
+                ),
+            )
+        }
+        (tiny_http::Method::Get, "/stream") => {
+            let (tx, rx) = mpsc::channel();
+            // Replay the current full state as the stream's first event so a
+            // client that just connected doesn't have to wait for the next
+            // change to know where things stand.
+            let _ = tx.send(shared.full_state_json().to_string());
+            shared.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+            let body = SseBody { rx, pending: Vec::new() };
+            let response = tiny_http::Response::new(
+                tiny_http::StatusCode(200),
+                vec![
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
+                        .expect("static header is always valid"),
+                    tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..])
+                        .expect("static header is always valid"),
+                ],
+                body,
+                None,
+                None,
+            );
+            request.respond(response)
+        }
+        _ => request.respond(tiny_http::Response::from_string("not found").with_status_code(404)),
+    };
+    if let Err(error) = response_result {
+        // A client disconnecting mid-response is routine, not a plugin bug -
+        // logging it would just be noise on every ordinary tab close.
+        let _ = error;
+    }
+}
+
+/// Spawns the HTTP server on its own thread. `tiny_http`'s server loop is
+/// synchronous and would otherwise block accepting new connections for as
+/// long as a `/stream` client stays open, so every individual request is
+/// handed off to its own short-lived thread immediately after being accepted.
+fn spawn_http_server(shared: Shared) {
+    thread::spawn(move || {
+        let server = match tiny_http::Server::http(LISTEN_ADDRESS) {
+            Ok(server) => server,
+            Err(_) => return, // address already in use (a previous instance?) - stay silent, don't crash the game
+        };
+        for request in server.incoming_requests() {
+            // Reserve a slot before spawning - fetch_update only succeeds (and
+            // increments) while under the cap, so a request arriving at the
+            // cap is rejected here rather than after already spawning a
+            // thread for it.
+            let reserved = shared
+                .active_connections
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    (n < MAX_HTTP_CONNECTIONS).then_some(n + 1)
+                })
+                .is_ok();
+            if !reserved {
+                let _ = request.respond(
+                    tiny_http::Response::from_string("too many connections").with_status_code(503),
+                );
+                continue;
+            }
+
+            let shared = shared.clone();
+            thread::spawn(move || {
+                let _guard = ConnectionGuard(shared.active_connections.clone());
+                handle_request(request, &shared);
+            });
+        }
+    });
+}
+
+/// Grows `wheels` with default entries so index `i` is valid, if it isn't
+/// already - wheel-indexed updates can arrive in any order, and a later
+/// index (e.g. a rear tag axle) may be updated before an earlier one.
+fn ensure_wheel_len(wheels: &mut Vec<WheelState>, i: usize) {
+    if wheels.len() <= i {
+        wheels.resize(i + 1, WheelState::default());
+    }
+}
+
+/// Decodes the `truck` static-specs configuration into [`TruckSpec`].
+fn decode_truck_spec(event: &ConfigurationEvent<'_>) -> TruckSpec {
+    TruckSpec {
+        brand_id: event.string_owned(configuration::attributes::BRAND_ID).unwrap_or_default(),
+        brand: event.string_owned(configuration::attributes::BRAND).unwrap_or_default(),
+        id: event.string_owned(configuration::attributes::ID).unwrap_or_default(),
+        name: event.string_owned(configuration::attributes::NAME).unwrap_or_default(),
+        license_plate: event.string_owned(configuration::attributes::LICENSE_PLATE).unwrap_or_default(),
+        license_plate_country: event.string_owned(configuration::attributes::LICENSE_PLATE_COUNTRY).unwrap_or_default(),
+        fuel_capacity_liters: event.get(configuration::attributes::FUEL_CAPACITY).unwrap_or_default(),
+        fuel_warning_factor: event.get(configuration::attributes::FUEL_WARNING_FACTOR).unwrap_or_default(),
+        adblue_capacity_liters: event.get(configuration::attributes::ADBLUE_CAPACITY).unwrap_or_default(),
+        adblue_warning_factor: event.get(configuration::attributes::ADBLUE_WARNING_FACTOR).unwrap_or_default(),
+        rpm_limit: event.get(configuration::attributes::RPM_LIMIT).unwrap_or_default(),
+        forward_gear_count: event.get(configuration::attributes::FORWARD_GEAR_COUNT).unwrap_or_default(),
+        reverse_gear_count: event.get(configuration::attributes::REVERSE_GEAR_COUNT).unwrap_or_default(),
+        retarder_step_count: event.get(configuration::attributes::RETARDER_STEP_COUNT).unwrap_or_default(),
+        wheel_steerable: decode_indexed_bools(event, configuration::attributes::WHEEL_STEERABLE),
+        wheel_powered: decode_indexed_bools(event, configuration::attributes::WHEEL_POWERED),
+        wheel_liftable: decode_indexed_bools(event, configuration::attributes::WHEEL_LIFTABLE),
+        // Overwritten by the caller right after this returns (see
+        // handle_configuration's TRUCK branch) - this event has no
+        // shifter_type attribute of its own, that comes from `controls`.
+        shifter_type: String::new(),
+    }
+}
+
+/// Decodes the `trailer` static-specs configuration into [`TrailerSpec`].
+/// Shares the `name`/`WHEEL_LIFTABLE` attribute names with `truck` - SCS
+/// reuses the same attribute name across multiple configuration ids, the
+/// same pattern that let `decode_job` work unchanged against `car_job`.
+fn decode_trailer_spec(event: &ConfigurationEvent<'_>) -> TrailerSpec {
+    TrailerSpec {
+        name: event.string_owned(configuration::attributes::NAME).unwrap_or_default(),
+        wheel_liftable: decode_indexed_bools(event, configuration::attributes::WHEEL_LIFTABLE),
+    }
+}
+
+/// Reads every index of an indexed boolean attribute up to `MAX_WHEEL_INDEX`,
+/// stopping at the first index that returns nothing - real wheel indices are
+/// contiguous starting at 0, so a gap means the real count has been reached.
+fn decode_indexed_bools(event: &ConfigurationEvent<'_>, attribute: Attribute<bool>) -> Vec<bool> {
+    let mut values = Vec::new();
+    for i in 0..MAX_WHEEL_INDEX {
+        let Some(index) = scs_sdk_plugin::sdk::SdkIndex::new(i) else { break };
+        let Some(value) = event.get_at(attribute, index) else { break };
+        values.push(value);
+    }
+    values
+}
+
+/// Upper bound on H-shifter gear slots this build looks for - real ATS/ETS2
+/// trucks use well under this (typically under 20 counting range/splitter
+/// combinations); generous rather than exact for the same reason as
+/// `MAX_WHEEL_INDEX` above.
+const MAX_HSHIFTER_SLOTS: u32 = 32;
+
+/// Decodes the `hshifter` configuration into [`HshifterInfo`] - this is what
+/// TruckHub's own H-shifter calibration feature (Ctrl+Alt+G gear capture)
+/// needs: which physical slot/selector combination maps to which real gear.
+fn decode_hshifter(event: &ConfigurationEvent<'_>) -> HshifterInfo {
+    let selector_count = event.get(configuration::attributes::SELECTOR_COUNT).unwrap_or_default();
+    let mut slots = Vec::new();
+    for slot in 0..MAX_HSHIFTER_SLOTS {
+        let Some(index) = scs_sdk_plugin::sdk::SdkIndex::new(slot) else { continue };
+        let Some(gear) = event.get_at(configuration::attributes::SLOT_GEAR, index) else { continue };
+        let handle_position = event.get_at(configuration::attributes::SLOT_HANDLE_POSITION, index).unwrap_or_default();
+        let selectors = event.get_at(configuration::attributes::SLOT_SELECTORS, index).unwrap_or_default();
+        slots.push(HshifterSlot { slot, gear, handle_position, selectors });
+    }
+    HshifterInfo { selector_count, slots }
+}
+
+/// Decodes the `job` configuration into [`JobInfo`].
+///
+/// `job_market_raw` and `job_market_known` are kept side by side deliberately:
+/// this plugin was written specifically because a newer job type (ATS's Road
+/// Trip DLC "Quick Jobs") wasn't visible through the previous telemetry
+/// bridge at all. If SCS ever adds a `job.market` value this build's typed
+/// enum doesn't recognize yet, `job_market_raw` still carries it through
+/// untouched instead of silently dropping it - a consumer can act on the raw
+/// string today and doesn't have to wait for a plugin rebuild.
+///
+/// `car_job` is not just `job` under a different id - confirmed by diffing
+/// the real official SDK 1.15 headers (this crate audits 1.14): its market
+/// attribute is named `car_job.market`, not `job.market`, and it has no
+/// `cargo_mass`/`is_cargo_loaded`/`special_job` attributes at all (a car job
+/// genuinely has none of those concepts). Found live: this plugin's very
+/// first car_job support silently read the wrong attribute name and always
+/// got back an empty market string - not "unrecognized", just wrong name.
+fn decode_job(event: &ConfigurationEvent<'_>, source_kind: &str) -> JobInfo {
+    if !event.has_attributes() {
+        return JobInfo { active: false, source_kind: source_kind.to_string(), ..JobInfo::default() };
+    }
+    let job_market_raw = if source_kind == "car_job" {
+        let car_job_market =
+            Attribute::<StringValue>::new(c"car_job.market", GameSchemaAvailability::new(None, None));
+        event.string_owned(car_job_market).unwrap_or_default()
+    } else {
+        event.string_owned(configuration::attributes::JOB_MARKET).unwrap_or_default()
+    };
+    JobInfo {
+        active: true,
+        source_kind: source_kind.to_string(),
+        cargo: event.string_owned(configuration::attributes::CARGO).unwrap_or_default(),
+        cargo_id: event.string_owned(configuration::attributes::CARGO_ID).unwrap_or_default(),
+        cargo_mass_kg: event.get(configuration::attributes::CARGO_MASS).unwrap_or_default(),
+        source_city: event.string_owned(configuration::attributes::SOURCE_CITY).unwrap_or_default(),
+        source_city_id: event.string_owned(configuration::attributes::SOURCE_CITY_ID).unwrap_or_default(),
+        source_company: event.string_owned(configuration::attributes::SOURCE_COMPANY).unwrap_or_default(),
+        source_company_id: event.string_owned(configuration::attributes::SOURCE_COMPANY_ID).unwrap_or_default(),
+        destination_city: event.string_owned(configuration::attributes::DESTINATION_CITY).unwrap_or_default(),
+        destination_city_id: event.string_owned(configuration::attributes::DESTINATION_CITY_ID).unwrap_or_default(),
+        destination_company: event.string_owned(configuration::attributes::DESTINATION_COMPANY).unwrap_or_default(),
+        destination_company_id: event.string_owned(configuration::attributes::DESTINATION_COMPANY_ID).unwrap_or_default(),
+        income: event.get(configuration::attributes::INCOME).unwrap_or_default(),
+        delivery_time_seconds: event.get(configuration::attributes::DELIVERY_TIME).unwrap_or_default(),
+        planned_distance_km: event.get(configuration::attributes::PLANNED_DISTANCE_KM).unwrap_or_default(),
+        cargo_loaded: event.get(configuration::attributes::IS_CARGO_LOADED).unwrap_or_default(),
+        special_job: event.get(configuration::attributes::SPECIAL_JOB).unwrap_or_default(),
+        job_market_raw,
+        job_market_known: event.job_market().map(|market| format!("{market:?}")),
+    }
+}
+
+#[derive(Default)]
+struct Plugin {
+    shared: Shared,
+    http_server_started: AtomicBool,
+    current_render_time: AtomicU64,
+    last_snapshot_broadcast_time: AtomicU64,
+    /// Refuel-detection state - see `detect_refuel`'s doc comment. Plain fields
+    /// (not Arc/Mutex/Atomic) because `detect_refuel` runs from `event`, which
+    /// the trait already gives `&mut self` for - no interior mutability needed.
+    refuel_last_fuel: f32,
+    refuel_ticker: u32,
+    refuel_stall_windows: u32,
+    /// Mirrors RenCloud's *internal* `refuel` cycle flag - true from the first
+    /// fuel-increase tick until the engine restarts, independent of
+    /// `client_refuel_active` below (see the doc comment on why these two are
+    /// deliberately different signals, not a duplicate).
+    refuel_cycle_pending: bool,
+    /// Mirrors RenCloud's *client-visible* `special_b.refuel` - can flip back
+    /// to false (firing a "refuel_ended" event) on any fuel decrease, even
+    /// while `refuel_cycle_pending` stays true awaiting an engine restart to
+    /// fire "refuel_paid". This is what TruckHub's existing RefuelStart/
+    /// RefuelEnd log lines are edge-triggered from; "refuel_paid" is edge-
+    /// triggered from `refuel_cycle_pending` instead.
+    client_refuel_active: bool,
+    refuel_tmp_fuel: f32,
+    refuel_start_fuel: f32,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Shared::new()
+    }
+}
+
+impl Plugin {
+    /// Applies one channel callback to the live snapshot. Only one branch
+    /// ever matches per call (`ChannelUpdate::value` checks both the
+    /// descriptor and the SDK's own type tag), so an if-else chain - not a
+    /// match - is the natural shape here, same as the upstream example.
+    fn handle_channel(&self, update: ChannelUpdate<'_>) {
+        let mut snapshot = self.shared.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = update.value(channels::truck::WORLD_PLACEMENT) {
+            snapshot.placement = Placement {
+                position: Vec3 { x: v.position.x, y: v.position.y, z: v.position.z },
+                orientation: Orientation { heading: v.orientation.heading, pitch: v.orientation.pitch, roll: v.orientation.roll },
+            };
+        } else if let Some(v) = update.value(channels::truck::SPEED) { snapshot.speed_mps = v; }
+        else if let Some(v) = update.value(channels::truck::ENGINE_RPM) { snapshot.engine_rpm = v; }
+        else if let Some(v) = update.value(channels::truck::ENGINE_GEAR) { snapshot.engine_gear = v; }
+        else if let Some(v) = update.value(channels::truck::DISPLAYED_GEAR) { snapshot.displayed_gear = v; }
+        else if let Some(v) = update.value(channels::truck::CRUISE_CONTROL) { snapshot.cruise_control_mps = v; }
+        else if let Some(v) = update.value(channels::truck::PARKING_BRAKE) { snapshot.parking_brake = v; }
+        else if let Some(v) = update.value(channels::truck::MOTOR_BRAKE) { snapshot.motor_brake = v; }
+        else if let Some(v) = update.value(channels::truck::RETARDER_LEVEL) { snapshot.retarder_level = v; }
+        else if let Some(v) = update.value(channels::truck::BRAKE_AIR_PRESSURE) { snapshot.brake_air_pressure = v; }
+        else if let Some(v) = update.value(channels::truck::BRAKE_AIR_PRESSURE_WARNING) { snapshot.brake_air_pressure_warning = v; }
+        else if let Some(v) = update.value(channels::truck::BRAKE_AIR_PRESSURE_EMERGENCY) { snapshot.brake_air_pressure_emergency = v; }
+        else if let Some(v) = update.value(channels::truck::BRAKE_TEMPERATURE) { snapshot.brake_temperature = v; }
+        else if let Some(v) = update.value(channels::truck::FUEL) { snapshot.fuel_liters = v; }
+        else if let Some(v) = update.value(channels::truck::FUEL_WARNING) { snapshot.fuel_warning = v; }
+        else if let Some(v) = update.value(channels::truck::FUEL_AVERAGE_CONSUMPTION) { snapshot.fuel_average_consumption = v; }
+        else if let Some(v) = update.value(channels::truck::FUEL_RANGE) { snapshot.fuel_range_km = v; }
+        else if let Some(v) = update.value(channels::truck::ADBLUE) { snapshot.adblue_liters = v; }
+        else if let Some(v) = update.value(channels::truck::ADBLUE_WARNING) { snapshot.adblue_warning = v; }
+        else if let Some(v) = update.value(channels::truck::ADBLUE_AVERAGE_CONSUMPTION) { snapshot.adblue_average_consumption = v; }
+        else if let Some(v) = update.value(channels::truck::OIL_PRESSURE) { snapshot.oil_pressure = v; }
+        else if let Some(v) = update.value(channels::truck::OIL_PRESSURE_WARNING) { snapshot.oil_pressure_warning = v; }
+        else if let Some(v) = update.value(channels::truck::OIL_TEMPERATURE) { snapshot.oil_temperature = v; }
+        else if let Some(v) = update.value(channels::truck::WATER_TEMPERATURE) { snapshot.water_temperature = v; }
+        else if let Some(v) = update.value(channels::truck::WATER_TEMPERATURE_WARNING) { snapshot.water_temperature_warning = v; }
+        else if let Some(v) = update.value(channels::truck::BATTERY_VOLTAGE) { snapshot.battery_voltage = v; }
+        else if let Some(v) = update.value(channels::truck::BATTERY_VOLTAGE_WARNING) { snapshot.battery_voltage_warning = v; }
+        else if let Some(v) = update.value(channels::truck::ELECTRIC_ENABLED) { snapshot.electric_enabled = v; }
+        else if let Some(v) = update.value(channels::truck::ENGINE_ENABLED) { snapshot.engine_enabled = v; }
+        else if let Some(v) = update.value(channels::truck::LIGHT_LBLINKER) { snapshot.light_lblinker = v; }
+        else if let Some(v) = update.value(channels::truck::LIGHT_RBLINKER) { snapshot.light_rblinker = v; }
+        else if let Some(v) = update.value(channels::truck::HAZARD_WARNING) { snapshot.hazard_warning = v; }
+        else if let Some(v) = update.value(channels::truck::LIGHT_PARKING) { snapshot.light_parking = v; }
+        else if let Some(v) = update.value(channels::truck::LIGHT_LOW_BEAM) { snapshot.light_low_beam = v; }
+        else if let Some(v) = update.value(channels::truck::LIGHT_HIGH_BEAM) { snapshot.light_high_beam = v; }
+        else if let Some(v) = update.value(channels::truck::LIGHT_BEACON) { snapshot.light_beacon = v; }
+        else if let Some(v) = update.value(channels::truck::LIGHT_BRAKE) { snapshot.light_brake = v; }
+        else if let Some(v) = update.value(channels::truck::LIGHT_REVERSE) { snapshot.light_reverse = v; }
+        else if let Some(v) = update.value(channels::truck::DIFFERENTIAL_LOCK) { snapshot.differential_lock = v; }
+        else if let Some(v) = update.value(channels::truck::LIFT_AXLE) { snapshot.lift_axle = v; }
+        else if let Some(v) = update.value(channels::truck::LIFT_AXLE_INDICATOR) { snapshot.lift_axle_indicator = v; }
+        else if let Some(v) = update.value(channels::truck::TRAILER_LIFT_AXLE) { snapshot.trailer_lift_axle = v; }
+        else if let Some(v) = update.value(channels::truck::TRAILER_LIFT_AXLE_INDICATOR) { snapshot.trailer_lift_axle_indicator = v; }
+        else if let Some(v) = update.value(channels::truck::WEAR_ENGINE) { snapshot.wear_engine = v; }
+        else if let Some(v) = update.value(channels::truck::WEAR_TRANSMISSION) { snapshot.wear_transmission = v; }
+        else if let Some(v) = update.value(channels::truck::WEAR_CABIN) { snapshot.wear_cabin = v; }
+        else if let Some(v) = update.value(channels::truck::WEAR_CHASSIS) { snapshot.wear_chassis = v; }
+        else if let Some(v) = update.value(channels::truck::WEAR_WHEELS) { snapshot.wear_wheels = v; }
+        else if let Some(v) = update.value(channels::truck::ODOMETER) { snapshot.odometer_km = v; }
+        else if let Some(v) = update.value(channels::truck::NAVIGATION_DISTANCE) { snapshot.navigation_distance_m = v; }
+        else if let Some(v) = update.value(channels::truck::NAVIGATION_TIME) { snapshot.navigation_time_s = v; }
+        else if let Some(v) = update.value(channels::truck::NAVIGATION_SPEED_LIMIT) { snapshot.navigation_speed_limit_mps = v; }
+        else if let Some(v) = update.value(channels::trailer::CONNECTED) { snapshot.trailer.connected = v; }
+        else if let Some(v) = update.value(channels::trailer::CARGO_DAMAGE) { snapshot.trailer.cargo_damage = v; }
+        else if let Some(v) = update.value(channels::trailer::WORLD_PLACEMENT) {
+            snapshot.trailer.placement = Placement {
+                position: Vec3 { x: v.position.x, y: v.position.y, z: v.position.z },
+                orientation: Orientation { heading: v.orientation.heading, pitch: v.orientation.pitch, roll: v.orientation.roll },
+            };
+        }
+        else if let Some(v) = update.value(channels::trailer::WEAR_BODY) { snapshot.trailer.wear_body = v; }
+        else if let Some(v) = update.value(channels::trailer::WEAR_CHASSIS) { snapshot.trailer.wear_chassis = v; }
+        else if let Some(v) = update.value(channels::trailer::WEAR_WHEELS) { snapshot.trailer.wear_wheels = v; }
+        else if let Some(v) = update.value(channels::common::GAME_TIME) { snapshot.game_time_minutes = v; }
+        else if let Some(v) = update.value(channels::common::NEXT_REST_STOP) { snapshot.next_rest_stop_minutes = v; }
+        else if let Some(v) = update.value(channels::common::MULTIPLAYER_TIME_OFFSET) { snapshot.multiplayer_time_offset_minutes = v; }
+        else if let Some(v) = update.value(channels::truck::HSHIFTER_SLOT) { snapshot.hshifter_slot = v; }
+        else if let Some(index) = update.index() {
+            let i = index.raw() as usize;
+            if let Some(v) = update.value(channels::truck::HSHIFTER_SELECTOR) {
+                if snapshot.hshifter_selectors.len() <= i {
+                    snapshot.hshifter_selectors.resize(i + 1, false);
+                }
+                snapshot.hshifter_selectors[i] = v;
+            }
+            else if let Some(v) = update.value(channels::truck::WHEEL_SUSP_DEFLECTION) { ensure_wheel_len(&mut snapshot.truck_wheels, i); snapshot.truck_wheels[i].suspension_deflection = v; }
+            else if let Some(v) = update.value(channels::truck::WHEEL_ON_GROUND) { ensure_wheel_len(&mut snapshot.truck_wheels, i); snapshot.truck_wheels[i].on_ground = v; }
+            else if let Some(v) = update.value(channels::truck::WHEEL_SUBSTANCE) { ensure_wheel_len(&mut snapshot.truck_wheels, i); snapshot.truck_wheels[i].substance = v; }
+            else if let Some(v) = update.value(channels::truck::WHEEL_VELOCITY) { ensure_wheel_len(&mut snapshot.truck_wheels, i); snapshot.truck_wheels[i].velocity = v; }
+            else if let Some(v) = update.value(channels::truck::WHEEL_STEERING) { ensure_wheel_len(&mut snapshot.truck_wheels, i); snapshot.truck_wheels[i].steering = v; }
+            else if let Some(v) = update.value(channels::truck::WHEEL_ROTATION) { ensure_wheel_len(&mut snapshot.truck_wheels, i); snapshot.truck_wheels[i].rotation = v; }
+            else if let Some(v) = update.value(channels::truck::WHEEL_LIFT) { ensure_wheel_len(&mut snapshot.truck_wheels, i); snapshot.truck_wheels[i].lift = v; }
+            else if let Some(v) = update.value(channels::truck::WHEEL_LIFT_OFFSET) { ensure_wheel_len(&mut snapshot.truck_wheels, i); snapshot.truck_wheels[i].lift_offset = v; }
+            else if let Some(v) = update.value(channels::trailer::WHEEL_SUSP_DEFLECTION) { ensure_wheel_len(&mut snapshot.trailer.wheels, i); snapshot.trailer.wheels[i].suspension_deflection = v; }
+            else if let Some(v) = update.value(channels::trailer::WHEEL_ON_GROUND) { ensure_wheel_len(&mut snapshot.trailer.wheels, i); snapshot.trailer.wheels[i].on_ground = v; }
+            else if let Some(v) = update.value(channels::trailer::WHEEL_SUBSTANCE) { ensure_wheel_len(&mut snapshot.trailer.wheels, i); snapshot.trailer.wheels[i].substance = v; }
+            else if let Some(v) = update.value(channels::trailer::WHEEL_VELOCITY) { ensure_wheel_len(&mut snapshot.trailer.wheels, i); snapshot.trailer.wheels[i].velocity = v; }
+            else if let Some(v) = update.value(channels::trailer::WHEEL_STEERING) { ensure_wheel_len(&mut snapshot.trailer.wheels, i); snapshot.trailer.wheels[i].steering = v; }
+            else if let Some(v) = update.value(channels::trailer::WHEEL_ROTATION) { ensure_wheel_len(&mut snapshot.trailer.wheels, i); snapshot.trailer.wheels[i].rotation = v; }
+            else if let Some(v) = update.value(channels::trailer::WHEEL_LIFT) { ensure_wheel_len(&mut snapshot.trailer.wheels, i); snapshot.trailer.wheels[i].lift = v; }
+            else if let Some(v) = update.value(channels::trailer::WHEEL_LIFT_OFFSET) { ensure_wheel_len(&mut snapshot.trailer.wheels, i); snapshot.trailer.wheels[i].lift_offset = v; }
+        }
+    }
+
+    fn maybe_broadcast_snapshot(&self) {
+        let now = self.current_render_time.load(Ordering::Relaxed);
+        let last = self.last_snapshot_broadcast_time.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < SNAPSHOT_INTERVAL_MICROSECONDS {
+            return;
+        }
+        self.last_snapshot_broadcast_time.store(now, Ordering::Relaxed);
+        self.shared.broadcast(&self.shared.full_state_json().to_string());
+    }
+
+    /// Detects refueling and emits `refuel_started`/`refuel_ended`/`refuel_paid`
+    /// events - the official SDK 1.14 gameplay-event catalog has none of
+    /// these at all, confirmed by reading its real headers. Ported from
+    /// RenCloud/scs-sdk-plugin's `scs-telemetry/src/scs_telemetry.cpp`
+    /// (`telemetry_frame_start`, the exact per-tick fuel-delta heuristic
+    /// TruckHub's existing RefuelStart/RefuelEnd/RefuelPayed log lines already
+    /// come from) - found via a background research agent after confirming
+    /// no official signal exists, since TruckHub needs the same behavior
+    /// this new plugin is meant to replace.
+    ///
+    /// Two states, matching RenCloud's own two separate flags exactly (this
+    /// isn't a simplification - both are load-bearing):
+    /// - `client_refuel_active` = RenCloud's client-visible `special_b.refuel`:
+    ///   true while fuel is trending up, false the instant it trends down -
+    ///   edge-triggered here into `refuel_started`/`refuel_ended` events.
+    /// - `refuel_cycle_pending` = RenCloud's internal `refuel`: stays true
+    ///   from the first increase until the engine is next enabled, regardless
+    ///   of what `client_refuel_active` does meanwhile - edge-triggered into
+    ///   `refuel_paid`, matching the real behavior (paid fires on restarting
+    ///   the engine after refueling, not on the fuel gauge itself settling).
+    ///
+    /// Deliberately NOT ported: RenCloud exposes `refuel`/`refuelPayed` as
+    /// persistent booleans for a C# client to edge-detect itself, and its own
+    /// changelog documents a real bug from this (`refuelPayed` never resets,
+    /// so a later truck/profile change can misfire it - changelog.md #55 and
+    /// the "known issues" entry above it). Firing one-shot events directly
+    /// from the transition, right here, sidesteps that whole bug class - the
+    /// pending flag always gets cleared at the exact instant its event fires.
+    fn detect_refuel(&mut self) {
+        let (current_fuel, engine_enabled) = {
+            let snapshot = self.shared.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+            (snapshot.fuel_liters, snapshot.engine_enabled)
+        };
+        let last_fuel = self.refuel_last_fuel;
+
+        if !self.refuel_cycle_pending {
+            self.refuel_start_fuel = self.refuel_tmp_fuel;
+            self.refuel_tmp_fuel = current_fuel;
+        }
+
+        if current_fuel > last_fuel && last_fuel > 0.0 {
+            self.refuel_stall_windows = 0;
+            if !self.client_refuel_active {
+                self.client_refuel_active = true;
+                self.shared.broadcast(&serde_json::json!({"type":"event","data":{"name":"refuel_started"}}).to_string());
+            }
+            if !self.refuel_cycle_pending {
+                self.refuel_cycle_pending = true;
+            }
+        } else if current_fuel < last_fuel && self.client_refuel_active {
+            self.refuel_stall_windows = 0;
+            self.client_refuel_active = false;
+            self.shared.broadcast(&serde_json::json!({"type":"event","data":{"name":"refuel_ended"}}).to_string());
+        }
+
+        if self.refuel_cycle_pending && engine_enabled {
+            self.refuel_cycle_pending = false;
+            let amount = current_fuel - self.refuel_start_fuel;
+            self.shared.broadcast(&serde_json::json!({"type":"event","data":{"name":"refuel_paid","amount_liters":amount}}).to_string());
+        }
+
+        // Plateau detector: a real refuel animation eventually just stops
+        // (tank full, or player walks away) with no further decrease to
+        // trigger the branch above - without this, `client_refuel_active`
+        // would otherwise stay stuck true and never fire "ended". Checked
+        // once every 10 ticks (matching RenCloud's own tick-count window, not
+        // a fixed real-time duration - simulation tick rate isn't 1:1 with
+        // wall-clock seconds); 5 stable windows in a row (~50-60 ticks) means
+        // the value has been flat long enough to call it over.
+        self.refuel_ticker += 1;
+        if self.refuel_ticker > 10 {
+            self.refuel_ticker = 0;
+            if current_fuel == last_fuel {
+                self.refuel_stall_windows += 1;
+            } else {
+                self.refuel_stall_windows = 0;
+            }
+            if self.refuel_stall_windows >= 5 {
+                self.refuel_stall_windows = 0;
+                if self.client_refuel_active {
+                    self.client_refuel_active = false;
+                    self.shared.broadcast(&serde_json::json!({"type":"event","data":{"name":"refuel_ended"}}).to_string());
+                }
+            }
+        }
+
+        self.refuel_last_fuel = current_fuel;
+    }
+
+    fn handle_configuration(&self, context: &PluginContext<'_>, event: ConfigurationEvent<'_>) {
+        // Logged unconditionally, for every configuration id the game sends -
+        // not just the ones this plugin has a typed decoder for. Written
+        // specifically to check whether some Road Trip Quick Job might be
+        // arriving under a configuration id this build's SDK catalog (audited
+        // against SDK 1.14) doesn't have a named constant for; `.id()` reads
+        // the raw string regardless of whether any typed `ConfigurationId`
+        // constant recognizes it.
+        context.message(format_args!(
+            "[scs-telemetry-hub] configuration event: id={:?} has_attributes={}",
+            event.id(),
+            event.has_attributes()
+        ));
+        if event.is(configuration::ids::TRUCK) {
+            let mut spec = decode_truck_spec(&event);
+            // `truck` and `controls` are two separate configuration events with
+            // no guaranteed ordering - preserve whichever shifter_type is
+            // already known (from a `controls` event that arrived first)
+            // instead of always resetting it to blank here.
+            spec.shifter_type = self.shared.truck_spec.lock().unwrap_or_else(|e| e.into_inner()).shifter_type.clone();
+            *self.shared.truck_spec.lock().unwrap_or_else(|e| e.into_inner()) = spec;
+            return;
+        }
+        if event.is(configuration::ids::HSHIFTER) {
+            let hshifter = decode_hshifter(&event);
+            *self.shared.hshifter.lock().unwrap_or_else(|e| e.into_inner()) = hshifter;
+            return;
+        }
+        if event.is(configuration::ids::CONTROLS) {
+            let shifter_type = event.string_owned(configuration::attributes::SHIFTER_TYPE).unwrap_or_default();
+            self.shared.truck_spec.lock().unwrap_or_else(|e| e.into_inner()).shifter_type = shifter_type;
+            return;
+        }
+        // First trailer only, matching TruckHub's own existing convention
+        // (see TelemetrySnapshot's doc comment) - a numbered "trailer.0" and
+        // the legacy unnumbered "trailer" id both mean the same first slot,
+        // just under different SDK schema generations.
+        if event.is_legacy_trailer() || event.trailer_index() == Some(scs_sdk_plugin::sdk::TrailerIndex::ZERO) {
+            let spec = decode_trailer_spec(&event);
+            *self.shared.trailer_spec.lock().unwrap_or_else(|e| e.into_inner()) = spec;
+            return;
+        }
+        // `configuration::ids::JOB` only ever matches the literal "job" id.
+        // "car_job" (Road Trip DLC Quick Jobs) and "bus_job" (ETS2 Coaches
+        // DLC) are separate configuration ids this build's SDK catalog has no
+        // typed constant for at all - confirmed live by the unconditional
+        // `.id()` log above. `NamedValues::get`/`find` look attributes up by
+        // raw name regardless of which configuration id they arrived under,
+        // so the existing `decode_job` works unchanged against any of the
+        // three - only the id has to be matched by raw string here instead of
+        // the typed `ConfigurationId` constant.
+        let raw_id = event.id();
+        if raw_id == "job" || raw_id == "car_job" || raw_id == "bus_job" {
+            // Confirmed live (2026-10-01): ATS sends all three of job/
+            // car_job/bus_job together in one batch whenever job state
+            // changes - only whichever one matches the job's actual type
+            // carries real attributes, the other two arrive empty in the
+            // same batch. Naively applying every event in arrival order
+            // clobbered a genuine active job with a trailing empty one
+            // (car_job arrives last, so it always won). Fix: an empty event
+            // only clears our state if it's for the SAME id we currently
+            // consider active - an empty event for a *different* id is just
+            // noise from the other two job types and must be ignored.
+            let has_attributes = event.has_attributes();
+            let mut job_lock = self.shared.job.lock().unwrap_or_else(|e| e.into_inner());
+            if has_attributes || job_lock.source_kind == raw_id {
+                let job = decode_job(&event, &raw_id);
+                *job_lock = job.clone();
+                drop(job_lock);
+                // Job changes matter immediately, not just on the next
+                // throttled snapshot tick - a consumer waiting on this
+                // shouldn't have to poll or wait up to
+                // SNAPSHOT_INTERVAL_MICROSECONDS to see it.
+                self.shared.broadcast(&serde_json::json!({ "type": "job", "data": job }).to_string());
+            }
+        }
+    }
+
+    fn handle_gameplay(&self, context: &PluginContext<'_>, event: GameplayEvent<'_>) {
+        // Same reasoning as handle_configuration's unconditional log: catches
+        // any gameplay event id this build's typed catalog doesn't recognize,
+        // instead of silently dropping it in the final `else` branch below.
+        context.message(format_args!("[scs-telemetry-hub] gameplay event: id={:?}", event.id()));
+        let payload = if event.is(gameplay::events::JOB_DELIVERED) {
+            serde_json::json!({
+                "name": "job_delivered",
+                "revenue": event.get(gameplay::attributes::REVENUE).unwrap_or_default(),
+                "earned_xp": event.get(gameplay::attributes::EARNED_XP).unwrap_or_default(),
+                "cargo_damage": event.get(gameplay::attributes::CARGO_DAMAGE).unwrap_or_default(),
+                "distance_km": event.get(gameplay::attributes::DISTANCE_KM).unwrap_or_default(),
+                "delivery_time": event.get(gameplay::attributes::DELIVERY_TIME).unwrap_or_default(),
+                "auto_park_used": event.get(gameplay::attributes::AUTO_PARK_USED).unwrap_or_default(),
+                "auto_load_used": event.get(gameplay::attributes::AUTO_LOAD_USED).unwrap_or_default(),
+            })
+        } else if event.is(gameplay::events::JOB_CANCELLED) {
+            serde_json::json!({
+                "name": "job_cancelled",
+                "cancel_penalty": event.get(gameplay::attributes::CANCEL_PENALTY).unwrap_or_default(),
+            })
+        } else if event.is(gameplay::events::PLAYER_FINED) {
+            serde_json::json!({
+                "name": "player_fined",
+                "offence_raw": event.string_owned(gameplay::attributes::FINE_OFFENCE).unwrap_or_default(),
+                "offence_known": event.fine_offence().map(|o| format!("{o:?}")),
+                "amount": event.get(gameplay::attributes::FINE_AMOUNT).unwrap_or_default(),
+            })
+        } else if event.is(gameplay::events::PLAYER_TOLLGATE_PAID) {
+            serde_json::json!({
+                "name": "tollgate_paid",
+                "amount": event.get(gameplay::attributes::PAY_AMOUNT).unwrap_or_default(),
+            })
+        } else if event.is(gameplay::events::PLAYER_USE_FERRY) {
+            serde_json::json!({
+                "name": "ferry_used",
+                "amount": event.get(gameplay::attributes::PAY_AMOUNT).unwrap_or_default(),
+                "source_name": event.string_owned(gameplay::attributes::SOURCE_NAME).unwrap_or_default(),
+                "target_name": event.string_owned(gameplay::attributes::TARGET_NAME).unwrap_or_default(),
+            })
+        } else if event.is(gameplay::events::PLAYER_USE_TRAIN) {
+            serde_json::json!({
+                "name": "train_used",
+                "amount": event.get(gameplay::attributes::PAY_AMOUNT).unwrap_or_default(),
+                "source_name": event.string_owned(gameplay::attributes::SOURCE_NAME).unwrap_or_default(),
+                "target_name": event.string_owned(gameplay::attributes::TARGET_NAME).unwrap_or_default(),
+            })
+        } else if event.id() == "car_job.delivered" {
+            // Not in this build's typed catalog at all (audited against SDK
+            // 1.14; `car_job.delivered` is new in the real 1.15 headers) -
+            // matched by raw id, same reasoning as handle_configuration's
+            // car_job/bus_job fallback. Real 1.15 headers document a
+            // `vehicle_damage` attribute here instead of `cargo_damage` (a
+            // car job usually has no cargo to damage, but the vehicle
+            // itself can be) - no typed constant exists for it yet, so it's
+            // read via a hand-built descriptor rather than
+            // `gameplay::attributes::*`.
+            let vehicle_damage = Attribute::<f32>::new(c"vehicle_damage", GameSchemaAvailability::new(None, None));
+            serde_json::json!({
+                "name": "job_delivered",
+                "revenue": event.get(gameplay::attributes::REVENUE).unwrap_or_default(),
+                "earned_xp": event.get(gameplay::attributes::EARNED_XP).unwrap_or_default(),
+                "vehicle_damage": event.get(vehicle_damage).unwrap_or_default(),
+                "distance_km": event.get(gameplay::attributes::DISTANCE_KM).unwrap_or_default(),
+                "delivery_time": event.get(gameplay::attributes::DELIVERY_TIME).unwrap_or_default(),
+                "auto_park_used": event.get(gameplay::attributes::AUTO_PARK_USED).unwrap_or_default(),
+                "auto_load_used": event.get(gameplay::attributes::AUTO_LOAD_USED).unwrap_or_default(),
+            })
+        } else if event.id() == "car_job.cancelled" {
+            serde_json::json!({
+                "name": "job_cancelled",
+                "cancel_penalty": event.get(gameplay::attributes::CANCEL_PENALTY).unwrap_or_default(),
+            })
+        } else {
+            return;
+        };
+        self.shared.broadcast(&serde_json::json!({ "type": "event", "data": payload }).to_string());
+    }
+}
+
+impl TelemetryPlugin for Plugin {
+    fn metadata(&self) -> PluginMetadata {
+        PluginMetadata::new("SCS Telemetry Hub", env!("CARGO_PKG_VERSION"))
+    }
+
+    fn compatibility(&self) -> PluginCompatibility {
+        PluginCompatibility::new(TelemetryApiVersion::V1_01, &SUPPORTED_GAMES)
+    }
+
+    fn initialize(&mut self, context: &mut PluginContext<'_>) -> PluginResult {
+        let game_token = match context.game().kind() {
+            Game::AmericanTruckSimulator => "ats",
+            Game::EuroTruckSimulator2 => "ets2",
+            Game::Other => "unknown",
+        };
+        *self.shared.game_display_name.lock().unwrap_or_else(|e| e.into_inner()) = game_token.to_string();
+
+        context.subscribe_event(TelemetryEventKind::FrameStart)?;
+        context.subscribe_event(TelemetryEventKind::FrameEnd)?;
+        context.subscribe_event(TelemetryEventKind::Paused)?;
+        context.subscribe_event(TelemetryEventKind::Started)?;
+        context.subscribe_event(TelemetryEventKind::Configuration)?;
+        context.subscribe_event(TelemetryEventKind::Gameplay)?;
+
+        context.subscribe(channels::truck::WORLD_PLACEMENT)?;
+        context.subscribe(channels::truck::SPEED)?;
+        context.subscribe(channels::truck::ENGINE_RPM)?;
+        context.subscribe(channels::truck::ENGINE_GEAR)?;
+        context.subscribe(channels::truck::DISPLAYED_GEAR)?;
+        context.subscribe(channels::truck::CRUISE_CONTROL)?;
+        context.subscribe(channels::truck::PARKING_BRAKE)?;
+        context.subscribe(channels::truck::MOTOR_BRAKE)?;
+        context.subscribe(channels::truck::RETARDER_LEVEL)?;
+        context.subscribe(channels::truck::BRAKE_AIR_PRESSURE)?;
+        context.subscribe(channels::truck::BRAKE_AIR_PRESSURE_WARNING)?;
+        context.subscribe(channels::truck::BRAKE_AIR_PRESSURE_EMERGENCY)?;
+        context.subscribe(channels::truck::BRAKE_TEMPERATURE)?;
+        context.subscribe(channels::truck::FUEL)?;
+        context.subscribe(channels::truck::FUEL_WARNING)?;
+        context.subscribe(channels::truck::FUEL_AVERAGE_CONSUMPTION)?;
+        context.subscribe(channels::truck::FUEL_RANGE)?;
+        // AdBlue is ETS2-only at the SDK level (ATS trucks don't expose it at
+        // all, not even as a zeroed channel) - subscribing unconditionally
+        // made ATS reject the whole plugin at startup, confirmed live via
+        // ATS's own game.log.txt (successful API/schema negotiation followed
+        // immediately by an unexplained shutdown, with no further logging -
+        // traced to this exact subscription failing and propagating out of
+        // `initialize` via `?`, since ADBLUE's declared availability is
+        // `GameSchemaAvailability::new(Some(ets2::V1_12), None)` - `None` for
+        // ATS, not just a higher version threshold).
+        //
+        // Even on ETS2 these are `subscribe_optional`, not `subscribe` -
+        // confirmed live (2026-09-30) that a specific truck model without an
+        // AdBlue system fitted doesn't register `truck.adblue.consumption.average`
+        // at all (`SCS_RESULT_NOT_FOUND`), which crashed the whole plugin
+        // init the exact same way the ATS-wide case did. Being ETS2 isn't
+        // enough to guarantee a specific vehicle has these channels.
+        if context.game().kind() == Game::EuroTruckSimulator2 {
+            context.subscribe_optional(channels::truck::ADBLUE)?;
+            context.subscribe_optional(channels::truck::ADBLUE_WARNING)?;
+            context.subscribe_optional(channels::truck::ADBLUE_AVERAGE_CONSUMPTION)?;
+        }
+        context.subscribe(channels::truck::OIL_PRESSURE)?;
+        context.subscribe(channels::truck::OIL_PRESSURE_WARNING)?;
+        context.subscribe(channels::truck::OIL_TEMPERATURE)?;
+        context.subscribe(channels::truck::WATER_TEMPERATURE)?;
+        context.subscribe(channels::truck::WATER_TEMPERATURE_WARNING)?;
+        context.subscribe(channels::truck::BATTERY_VOLTAGE)?;
+        context.subscribe(channels::truck::BATTERY_VOLTAGE_WARNING)?;
+        context.subscribe(channels::truck::ELECTRIC_ENABLED)?;
+        context.subscribe(channels::truck::ENGINE_ENABLED)?;
+        context.subscribe(channels::truck::LIGHT_LBLINKER)?;
+        context.subscribe(channels::truck::LIGHT_RBLINKER)?;
+        context.subscribe(channels::truck::HAZARD_WARNING)?;
+        context.subscribe(channels::truck::LIGHT_PARKING)?;
+        context.subscribe(channels::truck::LIGHT_LOW_BEAM)?;
+        context.subscribe(channels::truck::LIGHT_HIGH_BEAM)?;
+        context.subscribe(channels::truck::LIGHT_BEACON)?;
+        context.subscribe(channels::truck::LIGHT_BRAKE)?;
+        context.subscribe(channels::truck::LIGHT_REVERSE)?;
+        context.subscribe(channels::truck::DIFFERENTIAL_LOCK)?;
+        context.subscribe(channels::truck::LIFT_AXLE)?;
+        context.subscribe(channels::truck::LIFT_AXLE_INDICATOR)?;
+        context.subscribe(channels::truck::TRAILER_LIFT_AXLE)?;
+        context.subscribe(channels::truck::TRAILER_LIFT_AXLE_INDICATOR)?;
+        context.subscribe(channels::truck::WEAR_ENGINE)?;
+        context.subscribe(channels::truck::WEAR_TRANSMISSION)?;
+        context.subscribe(channels::truck::WEAR_CABIN)?;
+        context.subscribe(channels::truck::WEAR_CHASSIS)?;
+        context.subscribe(channels::truck::WEAR_WHEELS)?;
+        context.subscribe(channels::truck::ODOMETER)?;
+        context.subscribe(channels::truck::NAVIGATION_DISTANCE)?;
+        context.subscribe(channels::truck::NAVIGATION_TIME)?;
+        context.subscribe(channels::truck::NAVIGATION_SPEED_LIMIT)?;
+        context.subscribe(channels::trailer::CONNECTED)?;
+        context.subscribe(channels::trailer::CARGO_DAMAGE)?;
+        context.subscribe(channels::trailer::WORLD_PLACEMENT)?;
+        context.subscribe(channels::trailer::WEAR_BODY)?;
+        context.subscribe(channels::trailer::WEAR_CHASSIS)?;
+        context.subscribe(channels::trailer::WEAR_WHEELS)?;
+
+        context.subscribe(channels::common::GAME_TIME)?;
+        context.subscribe(channels::common::NEXT_REST_STOP)?;
+        context.subscribe(channels::common::MULTIPLAYER_TIME_OFFSET)?;
+        context.subscribe(channels::truck::HSHIFTER_SLOT)?;
+        // Only 2 selectors are ever meaningful (0=splitter, 1=range - see
+        // TruckHub's own already-calibrated convention), but subscribed
+        // optionally since plenty of gearboxes have neither.
+        context.subscribe_at_optional(channels::truck::HSHIFTER_SELECTOR, scs_sdk_plugin::sdk::SdkIndex::new(0).expect("0 is a valid SdkIndex"))?;
+        context.subscribe_at_optional(channels::truck::HSHIFTER_SELECTOR, scs_sdk_plugin::sdk::SdkIndex::new(1).expect("1 is a valid SdkIndex"))?;
+
+        // Wheel count varies per vehicle (a car has fewer than a truck with a
+        // tag axle; a short trailer fewer than a tridem one) and isn't known
+        // until a later `truck`/`trailer` configuration event - too late to
+        // subscribe, since subscribing is only valid during `initialize`. So
+        // this subscribes optionally up to a generous fixed ceiling instead;
+        // `subscribe_at_optional` silently skips whatever index a specific
+        // vehicle doesn't actually have rather than erroring, and
+        // `ensure_wheel_len` (see `handle_channel`) sizes the output array to
+        // however many indices actually deliver a value.
+        for i in 0..MAX_WHEEL_INDEX {
+            let Some(index) = scs_sdk_plugin::sdk::SdkIndex::new(i) else { continue };
+            context.subscribe_at_optional(channels::truck::WHEEL_SUSP_DEFLECTION, index)?;
+            context.subscribe_at_optional(channels::truck::WHEEL_ON_GROUND, index)?;
+            context.subscribe_at_optional(channels::truck::WHEEL_SUBSTANCE, index)?;
+            context.subscribe_at_optional(channels::truck::WHEEL_VELOCITY, index)?;
+            context.subscribe_at_optional(channels::truck::WHEEL_STEERING, index)?;
+            context.subscribe_at_optional(channels::truck::WHEEL_ROTATION, index)?;
+            context.subscribe_at_optional(channels::truck::WHEEL_LIFT, index)?;
+            context.subscribe_at_optional(channels::truck::WHEEL_LIFT_OFFSET, index)?;
+            context.subscribe_at_optional(channels::trailer::WHEEL_SUSP_DEFLECTION, index)?;
+            context.subscribe_at_optional(channels::trailer::WHEEL_ON_GROUND, index)?;
+            context.subscribe_at_optional(channels::trailer::WHEEL_SUBSTANCE, index)?;
+            context.subscribe_at_optional(channels::trailer::WHEEL_VELOCITY, index)?;
+            context.subscribe_at_optional(channels::trailer::WHEEL_STEERING, index)?;
+            context.subscribe_at_optional(channels::trailer::WHEEL_ROTATION, index)?;
+            context.subscribe_at_optional(channels::trailer::WHEEL_LIFT, index)?;
+            context.subscribe_at_optional(channels::trailer::WHEEL_LIFT_OFFSET, index)?;
+        }
+
+        if !self.http_server_started.swap(true, Ordering::SeqCst) {
+            spawn_http_server(self.shared.clone());
+        }
+
+        context.message(format_args!(
+            "[scs-telemetry-hub] initialized, serving http://{LISTEN_ADDRESS}/snapshot and /stream"
+        ));
+        Ok(())
+    }
+
+    fn channel(&mut self, _context: &mut PluginContext<'_>, update: ChannelUpdate<'_>) {
+        self.handle_channel(update);
+    }
+
+    fn event(&mut self, context: &mut PluginContext<'_>, event: TelemetryEvent<'_>) {
+        match event {
+            TelemetryEvent::FrameStart(frame) => {
+                self.current_render_time.store(frame.render_time(), Ordering::Relaxed);
+            }
+            TelemetryEvent::FrameEnd => {
+                self.detect_refuel();
+                self.maybe_broadcast_snapshot();
+            }
+            TelemetryEvent::Paused => {
+                self.shared.snapshot.lock().unwrap_or_else(|e| e.into_inner()).game_paused = true;
+            }
+            TelemetryEvent::Started => {
+                self.shared.snapshot.lock().unwrap_or_else(|e| e.into_inner()).game_paused = false;
+            }
+            TelemetryEvent::Configuration(configuration_event) => {
+                self.handle_configuration(context, configuration_event);
+            }
+            TelemetryEvent::Gameplay(gameplay_event) => {
+                self.handle_gameplay(context, gameplay_event);
+            }
+        }
+    }
+
+    fn shutdown(&mut self, context: &mut PluginContext<'_>) {
+        self.shared.broadcast(&serde_json::json!({ "type": "disconnected" }).to_string());
+        context.message(format_args!("[scs-telemetry-hub] shutdown"));
+    }
+}
+
+export_plugin!(Plugin::default());
