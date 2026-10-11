@@ -137,6 +137,11 @@ struct JobInfo {
     destination_company: String,
     destination_company_id: String,
     income: u64,
+    /// Despite the name (kept for wire compatibility), this is NOT a
+    /// countdown in seconds - it's the SDK's `job.delivery.time` attribute,
+    /// an absolute deadline on the in-game clock, in game-minutes (the same
+    /// units/epoch as the `game_time_minutes` channel). Minutes remaining is
+    /// `delivery_time_seconds - game_time_minutes`, not this field alone.
     delivery_time_seconds: u32,
     planned_distance_km: u32,
     cargo_loaded: bool,
@@ -167,15 +172,23 @@ struct WheelState {
     lift_offset: f32,
 }
 
-/// Every subscription in `initialize` for wheel-indexed channels loops up to
-/// this many indices using `subscribe_at_optional`, which silently skips any
-/// index a specific vehicle doesn't actually have - see that call site for
-/// why this can't instead be sized exactly once the real count is known
-/// (subscribing is only valid during `initialize`, before any configuration
-/// event has told us how many wheels this vehicle has). 24 comfortably covers
-/// any real ATS/ETS2 truck+trailer combination, including multi-axle
-/// oversize-load trailers.
+/// Upper bound for reading the indexed wheel attributes (`wheel.steerable`
+/// and friends) out of a configuration event, which stops at the first
+/// missing index anyway. The wheel *channel* subscriptions use the exact
+/// per-kind limits below instead.
 const MAX_WHEEL_INDEX: u32 = 24;
+
+/// How many wheel indices the games actually accept for the `truck.wheel.*`
+/// and `trailer.wheel.*` channels. Subscribing past these still works
+/// (`subscribe_at_optional` tolerates it) but makes the SDK write an ERROR
+/// line to the game log for every rejected index - 112 of them per game
+/// start before these limits were applied. The values are what ATS 1.61.3.1
+/// and ETS2 1.61.1.1 both reported: truck indices 14+ and trailer indices
+/// 20+ are "not valid". They can't be sized from the real wheel count
+/// instead, since the framework only allows subscribing during `initialize`,
+/// before any configuration event has said how many wheels a vehicle has.
+const MAX_TRUCK_WHEEL_INDEX: u32 = 14;
+const MAX_TRAILER_WHEEL_INDEX: u32 = 20;
 
 /// One H-shifter gear-slot mapping, decoded from the `hshifter` configuration.
 #[derive(Serialize, Clone, Debug)]
@@ -299,6 +312,10 @@ struct Shared {
     /// at MAX_HTTP_CONNECTIONS so a runaway/reconnecting client can't grow
     /// threads unboundedly inside the host process.
     active_connections: Arc<AtomicUsize>,
+    /// The running HTTP server, kept here so `Plugin::shutdown` can stop it -
+    /// `spawn_http_server`'s own thread only holds a clone. `None` before it
+    /// starts and again once it has been stopped.
+    server: Arc<Mutex<Option<Arc<tiny_http::Server>>>>,
 }
 
 /// Hard cap on concurrent HTTP connections (each backed by its own OS thread
@@ -319,6 +336,30 @@ impl Shared {
             subscribers: Arc::new(Mutex::new(Vec::new())),
             game_display_name: Arc::new(Mutex::new(String::new())),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            server: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Tells every open `/stream` client the plugin is going away, then ends
+    /// their streams. Dropping the senders is what ends them: `SseBody::read`
+    /// returns EOF once its channel is empty and disconnected, so each client
+    /// still receives the `disconnected` message queued just before.
+    fn end_streams(&self) {
+        self.broadcast(&serde_json::json!({ "type": "disconnected" }).to_string());
+        self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Stops accepting connections and closes the listening socket.
+    ///
+    /// `unblock` ends the accept-loop thread's iterator; once that thread
+    /// drops its own clone the `tiny_http::Server` is dropped, which wakes its
+    /// internal accept thread and releases the port. Without this a client
+    /// retrying after the game has unloaded the plugin would still be
+    /// accepted by a listener whose code is gone.
+    fn stop_http_server(&self) {
+        let server = self.server.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(server) = server {
+            server.unblock();
         }
     }
 
@@ -431,16 +472,72 @@ fn handle_request(request: tiny_http::Request, shared: &Shared) {
     }
 }
 
-/// Spawns the HTTP server on its own thread. `tiny_http`'s server loop is
-/// synchronous and would otherwise block accepting new connections for as
-/// long as a `/stream` client stays open, so every individual request is
-/// handed off to its own short-lived thread immediately after being accepted.
-fn spawn_http_server(shared: Shared) {
+/// Keeps this DLL mapped for the rest of the process's life, so nothing it
+/// spawned can ever run code from an image the game has already unloaded.
+///
+/// The game calls `scs_telemetry_shutdown` and then unmaps the DLL, but
+/// `tiny_http` owns detached worker threads this plugin has no handle to (its
+/// accept thread, and a pool of workers that only exit ~5 seconds after the
+/// server is dropped), so they can't be joined before that unload. A thread
+/// that wakes inside unmapped code is an access violation at game exit; one
+/// such fault was logged against `scs_telemetry_hub.dll_unloaded`. Pinning
+/// makes the game's unload a no-op for this module instead - the threads then
+/// wind down harmlessly and everything is released when the process ends.
+#[cfg(windows)]
+mod module_pin {
+    use std::ffi::c_void;
+
+    const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x0000_0001;
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleExW(flags: u32, module_name: *const u16, module: *mut *mut c_void) -> i32;
+    }
+
+    /// Returns whether the module containing this function is now pinned.
+    pub fn pin_current_module() -> bool {
+        let mut module: *mut c_void = std::ptr::null_mut();
+        // FROM_ADDRESS makes the second argument an address inside the module
+        // (not a name), and this function's own address is one. PIN needs no
+        // matching release - the module simply stays loaded until process exit.
+        let address = pin_current_module as *const ();
+        // SAFETY: `address` points into this module and `module` is a valid
+        // out-pointer for the duration of the call.
+        unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                address as *const u16,
+                &mut module,
+            ) != 0
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod module_pin {
+    /// This plugin only targets the Windows game builds.
+    pub fn pin_current_module() -> bool {
+        false
+    }
+}
+
+/// Binds the HTTP server and starts serving it on its own thread. `tiny_http`'s
+/// server loop is synchronous and would otherwise block accepting new
+/// connections for as long as a `/stream` client stays open, so every
+/// individual request is handed off to its own short-lived thread immediately
+/// after being accepted.
+///
+/// Binding happens here, synchronously, so a failure (address already in use -
+/// e.g. ATS and ETS2 both running) is reported to the caller instead of
+/// silently leaving a plugin with no server. The server is also stored in
+/// `shared.server` so `Shared::stop_http_server` can stop it later.
+fn start_http_server(shared: &Shared, address: &str) -> Result<(), String> {
+    let server = Arc::new(tiny_http::Server::http(address).map_err(|error| error.to_string())?);
+    *shared.server.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.clone());
+
+    let shared = shared.clone();
     thread::spawn(move || {
-        let server = match tiny_http::Server::http(LISTEN_ADDRESS) {
-            Ok(server) => server,
-            Err(_) => return, // address already in use (a previous instance?) - stay silent, don't crash the game
-        };
         for request in server.incoming_requests() {
             // Reserve a slot before spawning - fetch_update only succeeds (and
             // increments) while under the cap, so a request arriving at the
@@ -466,6 +563,7 @@ fn spawn_http_server(shared: Shared) {
             });
         }
     });
+    Ok(())
 }
 
 /// Grows `wheels` with default entries so index `i` is valid, if it isn't
@@ -1113,21 +1211,23 @@ impl TelemetryPlugin for Plugin {
         // tag axle; a short trailer fewer than a tridem one) and isn't known
         // until a later `truck`/`trailer` configuration event - too late to
         // subscribe, since subscribing is only valid during `initialize`. So
-        // this subscribes optionally up to a generous fixed ceiling instead;
-        // `subscribe_at_optional` silently skips whatever index a specific
-        // vehicle doesn't actually have rather than erroring, and
-        // `ensure_wheel_len` (see `handle_channel`) sizes the output array to
-        // however many indices actually deliver a value.
-        for i in 0..MAX_WHEEL_INDEX {
+        // this subscribes up to the games' own fixed limits instead (see
+        // `MAX_TRUCK_WHEEL_INDEX`); `subscribe_at_optional` silently skips
+        // whatever index a specific vehicle doesn't actually have rather than
+        // erroring, and `ensure_wheel_len` (see `handle_channel`) sizes the
+        // output array to however many indices actually deliver a value.
+        for i in 0..MAX_TRAILER_WHEEL_INDEX {
             let Some(index) = scs_sdk_plugin::sdk::SdkIndex::new(i) else { continue };
-            context.subscribe_at_optional(channels::truck::WHEEL_SUSP_DEFLECTION, index)?;
-            context.subscribe_at_optional(channels::truck::WHEEL_ON_GROUND, index)?;
-            context.subscribe_at_optional(channels::truck::WHEEL_SUBSTANCE, index)?;
-            context.subscribe_at_optional(channels::truck::WHEEL_VELOCITY, index)?;
-            context.subscribe_at_optional(channels::truck::WHEEL_STEERING, index)?;
-            context.subscribe_at_optional(channels::truck::WHEEL_ROTATION, index)?;
-            context.subscribe_at_optional(channels::truck::WHEEL_LIFT, index)?;
-            context.subscribe_at_optional(channels::truck::WHEEL_LIFT_OFFSET, index)?;
+            if i < MAX_TRUCK_WHEEL_INDEX {
+                context.subscribe_at_optional(channels::truck::WHEEL_SUSP_DEFLECTION, index)?;
+                context.subscribe_at_optional(channels::truck::WHEEL_ON_GROUND, index)?;
+                context.subscribe_at_optional(channels::truck::WHEEL_SUBSTANCE, index)?;
+                context.subscribe_at_optional(channels::truck::WHEEL_VELOCITY, index)?;
+                context.subscribe_at_optional(channels::truck::WHEEL_STEERING, index)?;
+                context.subscribe_at_optional(channels::truck::WHEEL_ROTATION, index)?;
+                context.subscribe_at_optional(channels::truck::WHEEL_LIFT, index)?;
+                context.subscribe_at_optional(channels::truck::WHEEL_LIFT_OFFSET, index)?;
+            }
             context.subscribe_at_optional(channels::trailer::WHEEL_SUSP_DEFLECTION, index)?;
             context.subscribe_at_optional(channels::trailer::WHEEL_ON_GROUND, index)?;
             context.subscribe_at_optional(channels::trailer::WHEEL_SUBSTANCE, index)?;
@@ -1138,13 +1238,33 @@ impl TelemetryPlugin for Plugin {
             context.subscribe_at_optional(channels::trailer::WHEEL_LIFT_OFFSET, index)?;
         }
 
-        if !self.http_server_started.swap(true, Ordering::SeqCst) {
-            spawn_http_server(self.shared.clone());
+        // Must happen before any thread is spawned - see `module_pin`.
+        if !module_pin::pin_current_module() {
+            context.warning(format_args!(
+                "[scs-telemetry-hub] could not pin the plugin module; background threads may outlive its unload"
+            ));
         }
 
-        context.message(format_args!(
-            "[scs-telemetry-hub] initialized, serving http://{LISTEN_ADDRESS}/snapshot and /stream"
-        ));
+        let mut serving = false;
+        if !self.http_server_started.swap(true, Ordering::SeqCst) {
+            match start_http_server(&self.shared, LISTEN_ADDRESS) {
+                Ok(()) => serving = true,
+                Err(error) => {
+                    self.http_server_started.store(false, Ordering::SeqCst);
+                    context.warning(format_args!(
+                        "[scs-telemetry-hub] could not start the HTTP server on {LISTEN_ADDRESS}: {error}"
+                    ));
+                }
+            }
+        }
+
+        if serving {
+            context.message(format_args!(
+                "[scs-telemetry-hub] initialized, serving http://{LISTEN_ADDRESS}/snapshot and /stream"
+            ));
+        } else {
+            context.message(format_args!("[scs-telemetry-hub] initialized, HTTP server not running"));
+        }
         Ok(())
     }
 
@@ -1177,9 +1297,173 @@ impl TelemetryPlugin for Plugin {
     }
 
     fn shutdown(&mut self, context: &mut PluginContext<'_>) {
-        self.shared.broadcast(&serde_json::json!({ "type": "disconnected" }).to_string());
+        // Clients get a clean end-of-stream right now instead of when the
+        // process finally dies, and the port is released so a client retrying
+        // in the gap before the game exits is refused rather than accepted.
+        self.shared.end_streams();
+        self.shared.stop_http_server();
+        self.http_server_started.store(false, Ordering::SeqCst);
         context.message(format_args!("[scs-telemetry-hub] shutdown"));
     }
 }
 
 export_plugin!(Plugin::default());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::{Duration, Instant};
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// Starts a real server on an ephemeral port and returns where it landed.
+    fn start(shared: &Shared) -> SocketAddr {
+        start_http_server(shared, "127.0.0.1:0").expect("binding an ephemeral port should work");
+        let server = shared
+            .server
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("start_http_server stores the server");
+        server.server_addr().to_ip().expect("an IP listener")
+    }
+
+    /// `Connection: close` makes the server end the connection once the
+    /// response is complete, so reading to EOF means "the response finished".
+    fn get(addr: SocketAddr, path: &str) -> TcpStream {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        stream
+    }
+
+    fn stop(shared: &Shared) {
+        shared.end_streams();
+        shared.stop_http_server();
+    }
+
+    #[test]
+    fn snapshot_endpoint_serves_json() {
+        let shared = Shared::new();
+        let addr = start(&shared);
+
+        let mut stream = get(addr, "/snapshot");
+        let mut body = String::new();
+        stream.read_to_string(&mut body).expect("response should complete");
+
+        assert!(body.contains("200 OK"), "unexpected response: {body}");
+        assert!(body.contains("\"type\":\"snapshot\""), "unexpected body: {body}");
+        stop(&shared);
+    }
+
+    /// Waits for `active_connections` to reach `expected` - i.e. for the
+    /// accept loop to have picked the connection up and handed it a thread.
+    fn wait_for_connections(shared: &Shared, expected: usize) {
+        let deadline = Instant::now() + WAIT;
+        while shared.active_connections.load(Ordering::SeqCst) != expected {
+            assert!(Instant::now() < deadline, "never reached {expected} active connections");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn stream_ends_cleanly_and_port_is_released_on_shutdown() {
+        let shared = Shared::new();
+        let addr = start(&shared);
+
+        let mut stream = get(addr, "/stream");
+        wait_for_connections(&shared, 1);
+        shared.broadcast("{\"type\":\"probe\"}");
+
+        // What `Plugin::shutdown` does.
+        stop(&shared);
+
+        // tiny_http buffers a streamed body until a chunk fills or the response
+        // ends, so everything arrives together here - in order - and then the
+        // stream really ends (EOF) instead of staying open until the process dies.
+        let mut body = String::new();
+        stream.read_to_string(&mut body).expect("stream should end, not time out");
+        let position = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing {needle} in: {body}"));
+        let snapshot = position("\"type\":\"snapshot\"");
+        let probe = position("\"type\":\"probe\"");
+        let disconnected = position("\"type\":\"disconnected\"");
+        assert!(snapshot < probe && probe < disconnected, "out of order: {body}");
+
+        // The listening socket gets released, so a retrying client is refused.
+        let deadline = Instant::now() + WAIT;
+        loop {
+            match TcpStream::connect(addr) {
+                Err(_) => break,
+                Ok(_) if Instant::now() > deadline => panic!("port still accepting connections after shutdown"),
+                Ok(_) => thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
+
+    /// TruckHub's HttpClient keeps its connection alive (no `Connection: close`)
+    /// and tells the stream has ended from the final zero-length chunk, not from
+    /// a closed socket - so that terminator must arrive on shutdown.
+    #[test]
+    fn keep_alive_stream_completes_on_shutdown() {
+        let shared = Shared::new();
+        let addr = start(&shared);
+
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        write!(stream, "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        wait_for_connections(&shared, 1);
+
+        stop(&shared);
+
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let deadline = Instant::now() + WAIT;
+        while !received.ends_with(b"0\r\n\r\n") {
+            assert!(Instant::now() < deadline, "no chunk terminator: {}", String::from_utf8_lossy(&received));
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&chunk[..n]),
+                Err(error) => panic!("read failed before the stream completed: {error}"),
+            }
+        }
+        let text = String::from_utf8_lossy(&received);
+        assert!(text.contains("\"type\":\"disconnected\""), "no disconnected message: {text}");
+        assert!(received.ends_with(b"0\r\n\r\n"), "response never completed: {text}");
+    }
+
+    #[test]
+    fn connections_beyond_the_cap_get_503() {
+        let shared = Shared::new();
+        let addr = start(&shared);
+
+        // Fill every slot with a long-lived stream, waiting for each to be
+        // registered so the count is exact before the next one connects.
+        let mut held = Vec::new();
+        for n in 1..=MAX_HTTP_CONNECTIONS {
+            held.push(get(addr, "/stream"));
+            wait_for_connections(&shared, n);
+        }
+
+        let mut extra = get(addr, "/stream");
+        let mut body = String::new();
+        extra.read_to_string(&mut body).expect("rejection should complete");
+        assert!(body.contains("503"), "expected a 503, got: {body}");
+        assert_eq!(shared.active_connections.load(Ordering::SeqCst), MAX_HTTP_CONNECTIONS);
+
+        // Ending the streams frees every slot again.
+        stop(&shared);
+        for mut stream in held {
+            let mut rest = String::new();
+            stream.read_to_string(&mut rest).expect("held stream should end on shutdown");
+        }
+        wait_for_connections(&shared, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn module_pin_succeeds() {
+        assert!(module_pin::pin_current_module());
+    }
+}

@@ -1,9 +1,42 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 (unreleased)
 
-Initial development. Not yet tagged or published - see the project's own notes for release
-readiness criteria before cutting a first version.
+### Fixed
+- `job.delivery_time_seconds` was undocumented and the name is misleading - it's not a countdown,
+  it's the SDK's absolute delivery deadline on the in-game clock, in game-minutes (same units/epoch
+  as `game_time_minutes`). Minutes remaining is `delivery_time_seconds - game_time_minutes`. Wire
+  name kept as-is for compatibility; this is a documentation fix, not a data change - a consumer
+  that read it as a countdown would have gotten a constant, meaningless value.
+- Shutdown now actually shuts down. `scs_telemetry_shutdown` used to send one `disconnected`
+  message and nothing else - the HTTP server and every open `/stream` connection stayed alive
+  until the game process itself died, so a client only learned the game had closed several
+  seconds later, from a connection reset. It now ends every stream (each client still receives
+  the `disconnected` message first) and closes the listening port, so a client retrying during
+  the game's exit is refused instead of connecting to a server whose plugin is about to unload.
+- The plugin module is now pinned in memory for the rest of the process's life. `tiny_http`
+  keeps detached worker threads this plugin has no handle to (they only exit ~5 seconds after the
+  server is dropped), so they can't be joined before the game unloads the DLL - and a thread that
+  wakes inside unloaded code is an access violation at game exit. One such fault was logged
+  against `scs_telemetry_hub.dll_unloaded`. Pinning makes the game's unload a no-op for this
+  module. This is the plugin's only `unsafe` code: one `GetModuleHandleExW` call.
+- No longer writes 112 `lookup_channel: index N is not valid` ERROR lines to the game log on
+  every start. Wheel channels were subscribed for indices 0-23, but both games only accept truck
+  indices 0-13 and trailer indices 0-19; subscribing is capped to exactly that. (It was harmless -
+  the subscriptions are optional - but real errors were buried in the noise.)
+- If the HTTP server can't start (port already in use, e.g. ATS and ETS2 running together), a
+  warning is now written to the game log instead of failing silently.
+
+### Added
+- Unit tests that run the real HTTP server: the `/snapshot` endpoint, a stream ending cleanly
+  with its port released on shutdown (both for a `Connection: close` client and for a keep-alive
+  one, which learns the stream ended from the final chunk), the connection cap returning `503`
+  and freeing its slots, and module pinning. Each shutdown behavior was checked by temporarily removing the fix and
+  confirming the test fails.
+
+## 0.1.0 (V1.0)
+
+Initial public release.
 
 ### Added
 - Local HTTP server (`127.0.0.1:38471`) publishing live telemetry as JSON - `GET /snapshot` for a

@@ -45,7 +45,8 @@ it.
   - a `{"type":"event", "data": {"name": "...", ...}}` message for gameplay events as they happen -
     `job_delivered`, `job_cancelled`, `player_fined`, `tollgate_paid`, `ferry_used`, `train_used`,
     `refuel_started`, `refuel_ended`, `refuel_paid`,
-  - a `{"type":"disconnected"}` message if the plugin is shutting down.
+  - a `{"type":"disconnected"}` message if the plugin is shutting down, after which the stream
+    ends and the port is closed.
 
 ### Snapshot shape (abbreviated)
 
@@ -97,6 +98,11 @@ upcoming Coaches DLC - the id already exists and is handled, ready for whenever 
 starts populating it. `job.source_kind` tells you which one a given job came from; the rest of the
 shape is the same either way (car jobs simply leave cargo-related fields at their defaults, since
 they genuinely have no cargo concept).
+
+`job.delivery_time_seconds`, despite its name (kept as-is for wire compatibility), is **not** a
+countdown - it's the SDK's own absolute deadline on the in-game clock, in game-minutes, the same
+units and epoch as the top-level `game_time_minutes` channel. Minutes remaining is
+`delivery_time_seconds - game_time_minutes`, not the field by itself.
 
 ### Refuel detection
 
@@ -154,6 +160,9 @@ cargo build --release
 
 Produces `target/release/scs_telemetry_hub.dll`, exporting the two entry points
 (`scs_telemetry_init`, `scs_telemetry_shutdown`) the SDK's plugin loader requires.
+
+`cargo test` runs the unit tests, which start the real HTTP server on an ephemeral port - no game
+needed.
 
 ## Status
 
