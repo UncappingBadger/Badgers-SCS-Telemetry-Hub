@@ -95,7 +95,7 @@ checksum = "d1bf5e335cf80cb8efb4cbe9e156f1505a1f07c410bf19fe5b84bad67af65754"
 
 [[package]]
 name = "scs_telemetry_hub"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "scs-sdk-plugin",
  "serde",

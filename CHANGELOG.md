@@ -1,8 +1,29 @@
 # Changelog
 
-## 0.1.1 (unreleased)
+## 0.1.2 (unreleased)
 
 ### Fixed
+- `/stream` could go silent for minutes after the game reset its render-time clock (a save,
+  vehicle switch, or profile reload) - `maybe_broadcast_snapshot`'s throttle computed `now - last`
+  with `saturating_sub`, which floors at 0 when the clock jumps backwards, so it kept concluding
+  "too soon" until the new timeline climbed back past the old high-water mark. `/snapshot` stayed
+  live throughout; only the periodic `snapshot` broadcasts stopped. Fixed by treating a backwards
+  jump as due for a broadcast immediately, the same as a fresh start.
+- `/stream` now writes and flushes every message by hand instead of going through tiny_http's
+  buffered `Response`/`Read`-body path, which only flushed once the body reached EOF (fine for a
+  response built in one go, not for a connection meant to stay open). A client connecting during a
+  stall used to receive 0 bytes - not even the HTTP status line - until the next broadcast; it now
+  gets headers immediately. The same rewrite adds a keepalive comment every 5s when nothing else is
+  being broadcast, so a client whose socket died is now noticed (a failed write) within one
+  keepalive interval instead of holding its connection slot indefinitely - previously only a real
+  broadcast could expose a dead connection, which combined with the stall above to exhaust
+  `MAX_HTTP_CONNECTIONS` during one live incident and start 503-ing every request, including
+  `/snapshot`.
+- `/snapshot` is now exempt from the `/stream` connection cap entirely (it completes on its own
+  thread almost immediately and never holds a slot open), so a pile-up of long-lived `/stream`
+  connections can no longer block a client's one-shot read.
+
+## 0.1.1
 - `job.delivery_time_seconds` was undocumented and the name is misleading - it's not a countdown,
   it's the SDK's absolute delivery deadline on the in-game clock, in game-minutes (same units/epoch
   as `game_time_minutes`). Minutes remaining is `delivery_time_seconds - game_time_minutes`. Wire

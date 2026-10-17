@@ -14,11 +14,12 @@
 //! non-blocking `mpsc::Sender::send` to broadcast to already-connected HTTP
 //! clients; the actual HTTP server runs on its own thread, spawned once.
 
-use std::io::{self, Read};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use scs_sdk_plugin::sdk::{
     Attribute, GameSchemaAvailability, StringValue, TelemetryApiVersion, channels, configuration,
@@ -41,6 +42,13 @@ const LISTEN_ADDRESS: &str = "127.0.0.1:38471";
 /// matches roughly what a HUD actually needs to redraw at, well under what a
 /// human can perceive as choppy.
 const SNAPSHOT_INTERVAL_MICROSECONDS: u64 = 100_000; // 10 Hz
+
+/// How often `/stream` sends a keepalive comment when nothing else is being
+/// broadcast. Without this, a stalled or paused session leaves a client
+/// unable to tell whether it's even connected (see `serve_stream`), and a
+/// client whose socket has died silently holds its connection slot forever
+/// instead of being noticed and reaped.
+const STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 static SUPPORTED_GAMES: [GameCompatibility; 2] = [
     GameCompatibility::new(Game::EuroTruckSimulator2, game::ets2::V1_00),
@@ -341,9 +349,9 @@ impl Shared {
     }
 
     /// Tells every open `/stream` client the plugin is going away, then ends
-    /// their streams. Dropping the senders is what ends them: `SseBody::read`
-    /// returns EOF once its channel is empty and disconnected, so each client
-    /// still receives the `disconnected` message queued just before.
+    /// their streams. Dropping the senders is what ends them: `serve_stream`'s
+    /// loop sees the channel disconnect once it's empty, so each client still
+    /// receives the `disconnected` message queued just before.
     fn end_streams(&self) {
         self.broadcast(&serde_json::json!({ "type": "disconnected" }).to_string());
         self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -395,30 +403,6 @@ impl Shared {
     }
 }
 
-/// Reads chunk-by-chunk from an `mpsc::Receiver<String>`, formatting each
-/// message as a Server-Sent Event. Blocks on `recv()` between messages - the
-/// dedicated thread this runs on has nothing else to do while a `/stream`
-/// connection is open, so blocking here is correct, not a bug.
-struct SseBody {
-    rx: mpsc::Receiver<String>,
-    pending: Vec<u8>,
-}
-
-impl Read for SseBody {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.pending.is_empty() {
-            match self.rx.recv() {
-                Ok(message) => self.pending = format!("data: {message}\n\n").into_bytes(),
-                Err(_) => return Ok(0), // sender side dropped -> plugin shut down, end the stream
-            }
-        }
-        let n = out.len().min(self.pending.len());
-        out[..n].copy_from_slice(&self.pending[..n]);
-        self.pending.drain(..n);
-        Ok(n)
-    }
-}
-
 /// Decrements `active_connections` when dropped, so the count is released on
 /// every exit path out of the request-handling thread - normal completion,
 /// an early return, or a panic unwinding the thread - without needing a
@@ -431,6 +415,17 @@ impl Drop for ConnectionGuard {
 }
 
 fn handle_request(request: tiny_http::Request, shared: &Shared) {
+    if *request.method() == tiny_http::Method::Get && request.url() == "/stream" {
+        let (tx, rx) = mpsc::channel();
+        // Replay the current full state as the stream's first event so a
+        // client that just connected doesn't have to wait for the next
+        // change to know where things stand.
+        let _ = tx.send(shared.full_state_json().to_string());
+        shared.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+        serve_stream(request, rx);
+        return;
+    }
+
     let response_result = match (request.method(), request.url()) {
         (tiny_http::Method::Get, "/snapshot") => {
             let body = shared.full_state_json().to_string();
@@ -441,28 +436,6 @@ fn handle_request(request: tiny_http::Request, shared: &Shared) {
                 ),
             )
         }
-        (tiny_http::Method::Get, "/stream") => {
-            let (tx, rx) = mpsc::channel();
-            // Replay the current full state as the stream's first event so a
-            // client that just connected doesn't have to wait for the next
-            // change to know where things stand.
-            let _ = tx.send(shared.full_state_json().to_string());
-            shared.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
-            let body = SseBody { rx, pending: Vec::new() };
-            let response = tiny_http::Response::new(
-                tiny_http::StatusCode(200),
-                vec![
-                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
-                        .expect("static header is always valid"),
-                    tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..])
-                        .expect("static header is always valid"),
-                ],
-                body,
-                None,
-                None,
-            );
-            request.respond(response)
-        }
         _ => request.respond(tiny_http::Response::from_string("not found").with_status_code(404)),
     };
     if let Err(error) = response_result {
@@ -470,6 +443,55 @@ fn handle_request(request: tiny_http::Request, shared: &Shared) {
         // logging it would just be noise on every ordinary tab close.
         let _ = error;
     }
+}
+
+/// Serves `/stream` by writing straight to the raw connection
+/// (`Request::into_writer`), bypassing tiny_http's normal `Response`/
+/// `Read`-body path entirely. That path only flushes once the body reader
+/// reaches EOF (see `tiny_http`'s own `Response::raw_print` doc: "does not
+/// flush the writer", and its client code wraps the socket in a 1 KB
+/// `BufWriter`) - fine for a response built in one go, but for a long-lived
+/// SSE connection it meant headers and small periodic messages all sat
+/// unflushed in that buffer until it filled or the connection closed,
+/// observed live as a client getting literally 0 bytes - not even the status
+/// line - for minutes during a stall. Writing and flushing by hand after
+/// every message fixes that, and the periodic keepalive doubles as a
+/// liveness probe: a dead client is now noticed within one
+/// `STREAM_KEEPALIVE_INTERVAL` (a failed write), instead of staying parked in
+/// a blocking read indefinitely and leaking its connection slot until the
+/// next real broadcast happened to expose the dead socket.
+///
+/// The request's own `Connection` header is deliberately not consulted -
+/// there's nothing to end early for a stream that only stops when the plugin
+/// shuts down or the client disconnects - and the hand-rolled chunk framing
+/// below keeps the same `Transfer-Encoding: chunked` wire format the
+/// previous `Response`-based implementation used, since a keep-alive client
+/// (TruckHub's `HttpClient` among them) relies on the trailing zero-length
+/// chunk, not a closed socket, to know the stream ended.
+fn serve_stream(request: tiny_http::Request, rx: mpsc::Receiver<String>) {
+    let mut writer = request.into_writer();
+    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n";
+    if writer.write_all(header).is_err() || writer.flush().is_err() {
+        return;
+    }
+    loop {
+        let chunk = match rx.recv_timeout(STREAM_KEEPALIVE_INTERVAL) {
+            Ok(message) => format!("data: {message}\n\n"),
+            Err(mpsc::RecvTimeoutError::Timeout) => ": ping\n\n".to_string(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break, // plugin shut down
+        };
+        let size_line = format!("{:x}\r\n", chunk.len());
+        let wrote = writer
+            .write_all(size_line.as_bytes())
+            .and_then(|_| writer.write_all(chunk.as_bytes()))
+            .and_then(|_| writer.write_all(b"\r\n"))
+            .and_then(|_| writer.flush());
+        if wrote.is_err() {
+            break; // client gone - the slot frees as soon as this thread returns
+        }
+    }
+    let _ = writer.write_all(b"0\r\n\r\n");
+    let _ = writer.flush();
 }
 
 /// Keeps this DLL mapped for the rest of the process's life, so nothing it
@@ -539,6 +561,18 @@ fn start_http_server(shared: &Shared, address: &str) -> Result<(), String> {
     let shared = shared.clone();
     thread::spawn(move || {
         for request in server.incoming_requests() {
+            // `/snapshot` completes on its own thread almost immediately and
+            // never holds a slot open, unlike `/stream` - so it's exempted
+            // from the cap entirely. Without this, a pile-up of long-lived
+            // `/stream` connections (e.g. reconnecting clients during a
+            // stall) could reach the cap and start 503-ing even a client that
+            // just wants a one-shot read.
+            if request.url() == "/snapshot" {
+                let shared = shared.clone();
+                thread::spawn(move || handle_request(request, &shared));
+                continue;
+            }
+
             // Reserve a slot before spawning - fetch_update only succeeds (and
             // increments) while under the cap, so a request arriving at the
             // cap is rejected here rather than after already spawning a
@@ -842,7 +876,15 @@ impl Plugin {
     fn maybe_broadcast_snapshot(&self) {
         let now = self.current_render_time.load(Ordering::Relaxed);
         let last = self.last_snapshot_broadcast_time.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < SNAPSHOT_INTERVAL_MICROSECONDS {
+        // A save/vehicle/profile reload resets the game's render-time clock to
+        // a small value, so `now` can land far below `last` (the high-water
+        // mark from before the reload). Plain `saturating_sub` turned that
+        // into a permanent stall: `now - last` floors at 0 forever, which is
+        // always "too soon", until the new timeline climbs back past the old
+        // one - observed live as `/stream` going silent for minutes while
+        // `/snapshot` stayed healthy. Treat a backwards jump as "broadcast
+        // now" instead of computing a nonsensical elapsed time from it.
+        if now >= last && now - last < SNAPSHOT_INTERVAL_MICROSECONDS {
             return;
         }
         self.last_snapshot_broadcast_time.store(now, Ordering::Relaxed);
@@ -1312,7 +1354,7 @@ export_plugin!(Plugin::default());
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
     use std::time::{Duration, Instant};
 
@@ -1380,9 +1422,10 @@ mod tests {
         // What `Plugin::shutdown` does.
         stop(&shared);
 
-        // tiny_http buffers a streamed body until a chunk fills or the response
-        // ends, so everything arrives together here - in order - and then the
-        // stream really ends (EOF) instead of staying open until the process dies.
+        // Each message is written and flushed as it's sent, in order, and the
+        // connection really ends (EOF) here instead of staying open until the
+        // process dies - this one read picks up everything at once simply
+        // because nothing read the socket until after `stop` had already run.
         let mut body = String::new();
         stream.read_to_string(&mut body).expect("stream should end, not time out");
         let position = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing {needle} in: {body}"));
@@ -1459,6 +1502,81 @@ mod tests {
             stream.read_to_string(&mut rest).expect("held stream should end on shutdown");
         }
         wait_for_connections(&shared, 0);
+    }
+
+    #[test]
+    fn snapshot_bypasses_the_connection_cap() {
+        let shared = Shared::new();
+        let addr = start(&shared);
+
+        // Fill every stream slot first.
+        let mut held = Vec::new();
+        for n in 1..=MAX_HTTP_CONNECTIONS {
+            held.push(get(addr, "/stream"));
+            wait_for_connections(&shared, n);
+        }
+
+        // /snapshot must still complete, and must not even transiently count
+        // against the cap /stream is subject to.
+        let mut snapshot = get(addr, "/snapshot");
+        let mut body = String::new();
+        snapshot
+            .read_to_string(&mut body)
+            .expect("snapshot should complete even while every stream slot is full");
+        assert!(body.contains("200 OK"), "unexpected response: {body}");
+        assert_eq!(shared.active_connections.load(Ordering::SeqCst), MAX_HTTP_CONNECTIONS);
+
+        stop(&shared);
+        for mut stream in held {
+            let mut rest = String::new();
+            stream.read_to_string(&mut rest).expect("held stream should end on shutdown");
+        }
+        wait_for_connections(&shared, 0);
+    }
+
+    /// A client that vanishes without a trace (no FIN, no further reads) is
+    /// never directly told about by the OS - the only way the server notices
+    /// is by trying to write to it. Before the keepalive loop, that only
+    /// happened on the next real broadcast, so a dead client with no traffic
+    /// held its slot forever; now the periodic ping discovers it within one
+    /// `STREAM_KEEPALIVE_INTERVAL`, with no broadcast at all.
+    #[test]
+    fn dead_stream_client_is_reaped_without_a_broadcast() {
+        let shared = Shared::new();
+        let addr = start(&shared);
+
+        let stream = get(addr, "/stream");
+        wait_for_connections(&shared, 1);
+        drop(stream);
+
+        let deadline = Instant::now() + STREAM_KEEPALIVE_INTERVAL + WAIT;
+        while shared.active_connections.load(Ordering::SeqCst) != 0 {
+            assert!(Instant::now() < deadline, "dead client was never reaped");
+            thread::sleep(Duration::from_millis(10));
+        }
+        stop(&shared);
+    }
+
+    /// Exercises `maybe_broadcast_snapshot` directly rather than through
+    /// `TelemetryEvent::FrameStart`/`FrameEnd` - those arms are one-line
+    /// delegations to `current_render_time`/this method and need no
+    /// `PluginContext`, so driving them through the full SDK event-dispatch
+    /// machinery would add nothing but a mock to build.
+    #[test]
+    fn snapshot_broadcast_resumes_after_a_render_time_restart() {
+        let plugin = Plugin::default();
+        let (tx, rx) = mpsc::channel();
+        plugin.shared.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+
+        plugin.current_render_time.store(5_000_000, Ordering::Relaxed);
+        plugin.maybe_broadcast_snapshot();
+        rx.recv_timeout(WAIT).expect("first broadcast should go out");
+
+        // A save/vehicle/profile reload resets the game's render-time clock.
+        plugin.current_render_time.store(100, Ordering::Relaxed);
+        plugin.maybe_broadcast_snapshot();
+        rx.recv_timeout(WAIT)
+            .expect("a backwards render-time jump must not stall broadcasts forever");
     }
 
     #[cfg(windows)]
