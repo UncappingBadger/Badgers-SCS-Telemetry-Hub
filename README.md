@@ -124,6 +124,12 @@ frozen at their last reading with no further update once a trailer stops being d
 than ever reporting them as invalid. A consumer must not trust `connected`/`placement` just because
 they look populated; check them only right after a fresh update.
 
+`trailer.connected` is subscribed with `EACH_FRAME` delivery rather than the SDK's default
+on-change-only, specifically so the reset above can't get stuck wrong: a spurious empty config
+during the menu/reload case above forces `connected` to `false` for at most one frame while the
+trailer is actually still attached, since the real value is then re-asserted on every subsequent
+frame instead of waiting for a genuine change that may never come.
+
 ### Refuel detection
 
 There's no official SDK event for refueling at all. `refuel_started` / `refuel_ended` /

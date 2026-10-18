@@ -22,8 +22,8 @@ use std::thread;
 use std::time::Duration;
 
 use scs_sdk_plugin::sdk::{
-    Attribute, FVector, GameSchemaAvailability, StringValue, TelemetryApiVersion, channels,
-    configuration, game, gameplay,
+    Attribute, ChannelFlags, FVector, GameSchemaAvailability, StringValue, TelemetryApiVersion,
+    channels, configuration, game, gameplay,
 };
 use scs_sdk_plugin::{
     ChannelUpdate, ConfigurationEvent, Game, GameCompatibility, GameplayEvent, PluginCompatibility,
@@ -1296,7 +1296,15 @@ impl TelemetryPlugin for Plugin {
         context.subscribe(channels::truck::NAVIGATION_DISTANCE)?;
         context.subscribe(channels::truck::NAVIGATION_TIME)?;
         context.subscribe(channels::truck::NAVIGATION_SPEED_LIMIT)?;
-        context.subscribe(channels::trailer::CONNECTED)?;
+        // EACH_FRAME, not the default on-change delivery: SCS only re-sends a
+        // channel when its value changes, so `connected` would otherwise
+        // never heal itself if anything else (an empty `trailer`
+        // configuration event, see `Shared::apply_trailer_configuration`)
+        // ever forces it to a wrong value - there would be no next "change"
+        // to correct it. Re-asserting the true value every frame means a
+        // wrong forced reset lasts at most one frame while the trailer is
+        // actually still attached.
+        context.subscribe_with_flags(channels::trailer::CONNECTED, ChannelFlags::EACH_FRAME)?;
         context.subscribe(channels::trailer::CARGO_DAMAGE)?;
         context.subscribe(channels::trailer::WORLD_PLACEMENT)?;
         context.subscribe(channels::trailer::WEAR_BODY)?;

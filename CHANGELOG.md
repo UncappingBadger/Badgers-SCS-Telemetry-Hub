@@ -19,6 +19,12 @@
   with no further signal that they've gone stale - live testing caught the hub reporting
   `connected=true` and a frozen placement for a trailer the truck had already driven 220 m away
   from.
+- That same reset could get permanently stuck wrong: `trailer.connected` was subscribed with the
+  SDK's default on-change-only delivery, so once a spurious empty config forced it to `false` while
+  the trailer was still actually attached, nothing would ever re-send `true` again - SCS only
+  re-sends a channel when its value changes, and from the SDK's side nothing had. Now subscribed
+  with `EACH_FRAME` instead, so the real value is re-asserted every frame and a wrong forced reset
+  lasts at most one frame.
 - `/stream` could go silent for minutes after the game reset its render-time clock (a save,
   vehicle switch, or profile reload) - `maybe_broadcast_snapshot`'s throttle computed `now - last`
   with `saturating_sub`, which floors at 0 when the clock jumps backwards, so it kept concluding
