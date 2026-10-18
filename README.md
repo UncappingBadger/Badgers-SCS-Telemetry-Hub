@@ -69,9 +69,14 @@ it.
   "truck_spec": {
     "brand": "Kenworth", "name": "W900", "fuel_capacity_liters": 454.25, "rpm_limit": 2100.0,
     "shifter_type": "hshifter",                 // "arcade" | "automatic" | "manual" | "hshifter"
+    "hook_position": { "x": 0.0, "y": 0.0, "z": -2.0 },  // 5th-wheel point, truck-local space
     "wheel_steerable": [true, false], "wheel_powered": [false, true], "wheel_liftable": [false]
   },
-  "trailer_spec": { "name": "", "wheel_liftable": [] },
+  "trailer_spec": {
+    "id": "...", "name": "",
+    "hook_position": { "x": 0.0, "y": 0.0, "z": 5.2 },   // kingpin point, trailer-local space
+    "wheel_liftable": []
+  },
   "hshifter": { "selector_count": 2, "slots": [ { "slot": 0, "gear": 1, "selectors": 0 } ] },
   "job": {
     "active": true, "source_kind": "job",       // "job" | "car_job" | "bus_job"
@@ -103,6 +108,21 @@ they genuinely have no cargo concept).
 countdown - it's the SDK's own absolute deadline on the in-game clock, in game-minutes, the same
 units and epoch as the top-level `game_time_minutes` channel. Minutes remaining is
 `delivery_time_seconds - game_time_minutes`, not the field by itself.
+
+### Trailer identity and staleness
+
+`trailer_spec` (id/name/hook_position/wheel_liftable) only updates when SCS sends a `trailer`
+configuration event with real attributes - it's deliberately NOT cleared by an empty one, since an
+empty event arrives both for a genuine detach and, confirmed live, as a spurious resend on a menu
+open or save reload while the exact same trailer is still physically hooked. Use `trailer_spec.id`
+(always present, unlike `name`, which only exists from ETS2 1.14/ATS 1.01 onward) to tell whether
+`trailer_spec` still describes the trailer you think it does.
+
+An empty `trailer` configuration event *does* reset `data.trailer.connected` to `false` and
+`data.trailer.placement` to zero, though - those are live channel values, and SCS leaves them
+frozen at their last reading with no further update once a trailer stops being described, rather
+than ever reporting them as invalid. A consumer must not trust `connected`/`placement` just because
+they look populated; check them only right after a fresh update.
 
 ### Refuel detection
 

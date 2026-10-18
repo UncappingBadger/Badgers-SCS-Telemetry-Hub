@@ -2,7 +2,23 @@
 
 ## 0.1.2 (unreleased)
 
+### Added
+- `truck_spec.hook_position` and `trailer_spec.hook_position` - the 5th-wheel and kingpin coupling
+  points, in each vehicle's own local space, decoded from the SDK's `hook.position` configuration
+  attribute (existed in the SDK all along, just never read). Lets a consumer compute exact hitch
+  alignment without surveying every vehicle by hand from coupled poses.
+- `trailer_spec.id` - a trailer identifier that's always present, unlike `name`, which the SDK only
+  sends from ETS2 1.14/ATS 1.01 onward.
+
 ### Fixed
+- `trailer_spec` used to be overwritten with blank data whenever SCS sent an empty `trailer`
+  configuration event - which happens both on a genuine detach and, confirmed live, as a spurious
+  resend on a menu open or save reload while the exact same trailer is still physically hooked. An
+  empty event no longer touches `trailer_spec`; it now only resets the live `data.trailer.connected`
+  flag and `data.trailer.placement`, which the SDK otherwise leaves frozen at their last reading
+  with no further signal that they've gone stale - live testing caught the hub reporting
+  `connected=true` and a frozen placement for a trailer the truck had already driven 220 m away
+  from.
 - `/stream` could go silent for minutes after the game reset its render-time clock (a save,
   vehicle switch, or profile reload) - `maybe_broadcast_snapshot`'s throttle computed `now - last`
   with `saturating_sub`, which floors at 0 when the clock jumps backwards, so it kept concluding

@@ -22,8 +22,8 @@ use std::thread;
 use std::time::Duration;
 
 use scs_sdk_plugin::sdk::{
-    Attribute, GameSchemaAvailability, StringValue, TelemetryApiVersion, channels, configuration,
-    game, gameplay,
+    Attribute, FVector, GameSchemaAvailability, StringValue, TelemetryApiVersion, channels,
+    configuration, game, gameplay,
 };
 use scs_sdk_plugin::{
     ChannelUpdate, ConfigurationEvent, Game, GameCompatibility, GameplayEvent, PluginCompatibility,
@@ -75,6 +75,24 @@ struct Placement {
     orientation: Orientation,
 }
 
+/// A fixed point in a vehicle's own local space - deliberately a different
+/// type from `Vec3`, which is always world space and changes every frame.
+/// Matches the SDK's own `FVector` axis convention (vehicle-local: +X right,
+/// +Y up, +Z backwards), kept here only because `FVector` itself has no
+/// `Serialize` impl.
+#[derive(Serialize, Default, Clone, Copy, Debug)]
+struct LocalPoint {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl From<FVector> for LocalPoint {
+    fn from(v: FVector) -> Self {
+        Self { x: v.x, y: v.y, z: v.z }
+    }
+}
+
 /// Everything read from the `truck` static-specs configuration - fetched once
 /// (re-sent by SCS whenever the truck/trailer setup changes) rather than
 /// polled every frame, since none of it changes mid-drive.
@@ -94,6 +112,10 @@ struct TruckSpec {
     forward_gear_count: u32,
     reverse_gear_count: u32,
     retarder_step_count: u32,
+    /// The 5th-wheel coupling point, in the truck's own local space - lets a
+    /// consumer compute exact hitch/kingpin alignment without surveying each
+    /// vehicle by hand from coupled poses.
+    hook_position: LocalPoint,
     /// Static per-wheel capability flags - distinct from the live per-wheel
     /// state in `Snapshot.truck_wheels`. Sized to whatever `WHEEL_COUNT`
     /// actually reports, not `MAX_WHEEL_INDEX` - TruckHub's EXT suspension
@@ -116,7 +138,15 @@ struct TruckSpec {
 /// nothing to decode for those two here).
 #[derive(Serialize, Default, Clone, Debug)]
 struct TrailerSpec {
+    /// Unlike `name` (only sent from ETS2 1.14/ATS 1.01 onward - blank on
+    /// older game versions), `id` is available from every version this
+    /// plugin supports, so it's the only reliable way to tell whether two
+    /// `trailer` configuration events describe the same physical trailer.
+    id: String,
     name: String,
+    /// The kingpin coupling point, in the trailer's own local space - the
+    /// trailer-side counterpart to `TruckSpec::hook_position`.
+    hook_position: LocalPoint,
     wheel_liftable: Vec<bool>,
 }
 
@@ -380,6 +410,37 @@ impl Shared {
         subs.retain(|tx| tx.send(message.to_string()).is_ok());
     }
 
+    /// Applies a `trailer` configuration event's effect on trailer state.
+    /// Split out of `handle_configuration` into something that takes an
+    /// already-decoded `TrailerSpec` (or `None` for an empty event) instead
+    /// of a `ConfigurationEvent` directly, since that type's constructor is
+    /// private to the SDK framework crate and can't be built from a unit
+    /// test here - same reasoning as calling `Plugin`'s own methods directly
+    /// in the render-time-restart test instead of mocking `FrameStartRef`.
+    ///
+    /// `Some(spec)` (a non-empty event) replaces the stored spec outright.
+    /// `None` (an empty event) deliberately does NOT touch the stored spec -
+    /// confirmed live, an empty `trailer` config arrives both on a genuine
+    /// detach and as a spurious resend on a menu open/reload while the same
+    /// trailer is still physically hooked, so wiping id/name/hook_position
+    /// here would lose real data for no reason. What an empty event DOES
+    /// invalidate is the live `connected`/`placement` channel state: SCS
+    /// leaves those frozen at their last reading with no further update once
+    /// a trailer stops being described, rather than ever reporting them as
+    /// invalid - live testing caught the hub reporting `connected=true` and
+    /// a frozen placement for a trailer the truck had already driven 220 m
+    /// away from, because nothing else ever told it the data had gone stale.
+    fn apply_trailer_configuration(&self, spec: Option<TrailerSpec>) {
+        match spec {
+            Some(spec) => *self.trailer_spec.lock().unwrap_or_else(|e| e.into_inner()) = spec,
+            None => {
+                let mut snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                snapshot.trailer.connected = false;
+                snapshot.trailer.placement = Placement::default();
+            }
+        }
+    }
+
     fn full_state_json(&self) -> serde_json::Value {
         let snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let truck_spec = self.truck_spec.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -626,6 +687,7 @@ fn decode_truck_spec(event: &ConfigurationEvent<'_>) -> TruckSpec {
         forward_gear_count: event.get(configuration::attributes::FORWARD_GEAR_COUNT).unwrap_or_default(),
         reverse_gear_count: event.get(configuration::attributes::REVERSE_GEAR_COUNT).unwrap_or_default(),
         retarder_step_count: event.get(configuration::attributes::RETARDER_STEP_COUNT).unwrap_or_default(),
+        hook_position: event.get(configuration::attributes::HOOK_POSITION).map(LocalPoint::from).unwrap_or_default(),
         wheel_steerable: decode_indexed_bools(event, configuration::attributes::WHEEL_STEERABLE),
         wheel_powered: decode_indexed_bools(event, configuration::attributes::WHEEL_POWERED),
         wheel_liftable: decode_indexed_bools(event, configuration::attributes::WHEEL_LIFTABLE),
@@ -642,7 +704,9 @@ fn decode_truck_spec(event: &ConfigurationEvent<'_>) -> TruckSpec {
 /// same pattern that let `decode_job` work unchanged against `car_job`.
 fn decode_trailer_spec(event: &ConfigurationEvent<'_>) -> TrailerSpec {
     TrailerSpec {
+        id: event.string_owned(configuration::attributes::ID).unwrap_or_default(),
         name: event.string_owned(configuration::attributes::NAME).unwrap_or_default(),
+        hook_position: event.get(configuration::attributes::HOOK_POSITION).map(LocalPoint::from).unwrap_or_default(),
         wheel_liftable: decode_indexed_bools(event, configuration::attributes::WHEEL_LIFTABLE),
     }
 }
@@ -1018,8 +1082,8 @@ impl Plugin {
         // the legacy unnumbered "trailer" id both mean the same first slot,
         // just under different SDK schema generations.
         if event.is_legacy_trailer() || event.trailer_index() == Some(scs_sdk_plugin::sdk::TrailerIndex::ZERO) {
-            let spec = decode_trailer_spec(&event);
-            *self.shared.trailer_spec.lock().unwrap_or_else(|e| e.into_inner()) = spec;
+            let spec = event.has_attributes().then(|| decode_trailer_spec(&event));
+            self.shared.apply_trailer_configuration(spec);
             return;
         }
         // `configuration::ids::JOB` only ever matches the literal "job" id.
@@ -1577,6 +1641,52 @@ mod tests {
         plugin.maybe_broadcast_snapshot();
         rx.recv_timeout(WAIT)
             .expect("a backwards render-time jump must not stall broadcasts forever");
+    }
+
+    /// Exercises `Shared::apply_trailer_configuration` directly rather than
+    /// through `TelemetryEvent::Configuration` - `ConfigurationEvent`'s
+    /// constructor is private to the SDK framework crate, so there's no way
+    /// to build one here (see that method's own doc comment for why this
+    /// split exists).
+    #[test]
+    fn trailer_configuration_with_attributes_replaces_the_spec() {
+        let shared = Shared::new();
+        let spec = TrailerSpec { id: "trailer_01".into(), name: "Container Master".into(), ..TrailerSpec::default() };
+
+        shared.apply_trailer_configuration(Some(spec));
+
+        let stored = shared.trailer_spec.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(stored.id, "trailer_01");
+        assert_eq!(stored.name, "Container Master");
+    }
+
+    #[test]
+    fn empty_trailer_configuration_keeps_the_spec_but_invalidates_live_state() {
+        let shared = Shared::new();
+        let spec = TrailerSpec { id: "trailer_01".into(), name: "Container Master".into(), ..TrailerSpec::default() };
+        shared.apply_trailer_configuration(Some(spec));
+        {
+            let mut snapshot = shared.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+            snapshot.trailer.connected = true;
+            snapshot.trailer.placement.position = Vec3 { x: 1.0, y: 2.0, z: 3.0 };
+        }
+
+        // An empty config - a genuine detach, or (confirmed live) a spurious
+        // resend on a menu open/reload while the same trailer is still
+        // hooked - must not erase the identity already known for it...
+        shared.apply_trailer_configuration(None);
+        let stored = shared.trailer_spec.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(stored.id, "trailer_01", "spec must survive an empty config");
+        assert_eq!(stored.name, "Container Master", "spec must survive an empty config");
+        drop(stored);
+
+        // ...but it must invalidate the live connected/placement state,
+        // which the SDK would otherwise leave frozen at its last reading
+        // forever with no further signal that it's gone stale.
+        let snapshot = shared.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!snapshot.trailer.connected, "connected must be reset - the old value can no longer be trusted");
+        let p = snapshot.trailer.placement.position;
+        assert_eq!((p.x, p.y, p.z), (0.0, 0.0, 0.0), "placement must be invalidated, not left frozen at its last reading");
     }
 
     #[cfg(windows)]
