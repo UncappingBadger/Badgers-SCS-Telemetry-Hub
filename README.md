@@ -73,9 +73,11 @@ it.
     "wheel_steerable": [true, false], "wheel_powered": [false, true], "wheel_liftable": [false]
   },
   "trailer_spec": {
-    "id": "...", "name": "",
+    "id": "...", "name": "", "body_type": "curtain", "chain_type": "",
     "hook_position": { "x": 0.0, "y": 0.0, "z": 5.2 },   // kingpin point, trailer-local space
-    "wheel_liftable": []
+    "wheel_liftable": [false],
+    "wheel_positions": [{ "x": 1.0, "y": -0.5, "z": 3.0 }],  // per wheel, trailer-local space
+    "wheel_radii": [0.5]
   },
   "hshifter": { "selector_count": 2, "slots": [ { "slot": 0, "gear": 1, "selectors": 0 } ] },
   "job": {
@@ -111,12 +113,15 @@ units and epoch as the top-level `game_time_minutes` channel. Minutes remaining 
 
 ### Trailer identity and staleness
 
-`trailer_spec` (id/name/hook_position/wheel_liftable) only updates when SCS sends a `trailer`
-configuration event with real attributes - it's deliberately NOT cleared by an empty one, since an
-empty event arrives both for a genuine detach and, confirmed live, as a spurious resend on a menu
-open or save reload while the exact same trailer is still physically hooked. Use `trailer_spec.id`
-(always present, unlike `name`, which only exists from ETS2 1.14/ATS 1.01 onward) to tell whether
-`trailer_spec` still describes the trailer you think it does.
+`trailer_spec` (id/name/body_type/chain_type/hook_position/wheel_liftable/wheel_positions/
+wheel_radii) only updates when SCS sends a `trailer` configuration event with real attributes -
+it's deliberately NOT cleared by an empty one, since an empty event arrives both for a genuine
+detach and, confirmed live, as a spurious resend on a menu open or save reload while the exact same
+trailer is still physically hooked. Use `trailer_spec.id` (always present, unlike `name`/
+`body_type`/`chain_type`, which only exist from ETS2 1.14/ATS 1.01 onward) to tell whether
+`trailer_spec` still describes the trailer you think it does. `wheel_positions`/`wheel_radii` give
+the real axle layout (count, spacing, rear-most overhang) - the SDK has no separate "trailer
+length" field at all, so this is the closest proxy to it.
 
 An empty `trailer` configuration event *does* reset `data.trailer.connected` to `false` and
 `data.trailer.placement` to zero, though - those are live channel values, and SCS leaves them

@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.1.2 (unreleased)
+## 0.1.3 (unreleased)
+
+### Added
+- `trailer_spec.body_type` and `trailer_spec.chain_type` - same ETS2 1.14/ATS 1.01+ version gate as
+  `name`.
+- `trailer_spec.wheel_positions` and `trailer_spec.wheel_radii` - per-wheel position (trailer-local
+  space) and radius, giving the real axle layout (count, spacing, rear-most overhang). The SDK has
+  no "trailer length" field at all; this is the closest proxy to it.
+
+## 0.1.2
 
 ### Added
 - `truck_spec.hook_position` and `trailer_spec.hook_position` - the 5th-wheel and kingpin coupling

@@ -147,7 +147,18 @@ struct TrailerSpec {
     /// The kingpin coupling point, in the trailer's own local space - the
     /// trailer-side counterpart to `TruckSpec::hook_position`.
     hook_position: LocalPoint,
+    /// One of a small set of C-identifier-style names (e.g. "curtain",
+    /// "tarp") - only sent from ETS2 1.14/ATS 1.01 onward, same as `name`.
+    body_type: String,
+    /// Same version gate as `body_type`.
+    chain_type: String,
     wheel_liftable: Vec<bool>,
+    /// Per-wheel position, in the trailer's own local space - the real axle
+    /// layout (count, spacing, rear-most overhang), unlike `wheel_liftable`
+    /// which only says which wheels can lift.
+    wheel_positions: Vec<LocalPoint>,
+    /// Per-wheel radius, parallel to `wheel_positions`.
+    wheel_radii: Vec<f32>,
 }
 
 /// Everything read from the `job` configuration for whatever job is currently
@@ -707,7 +718,11 @@ fn decode_trailer_spec(event: &ConfigurationEvent<'_>) -> TrailerSpec {
         id: event.string_owned(configuration::attributes::ID).unwrap_or_default(),
         name: event.string_owned(configuration::attributes::NAME).unwrap_or_default(),
         hook_position: event.get(configuration::attributes::HOOK_POSITION).map(LocalPoint::from).unwrap_or_default(),
+        body_type: event.string_owned(configuration::attributes::BODY_TYPE).unwrap_or_default(),
+        chain_type: event.string_owned(configuration::attributes::CHAIN_TYPE).unwrap_or_default(),
         wheel_liftable: decode_indexed_bools(event, configuration::attributes::WHEEL_LIFTABLE),
+        wheel_positions: decode_indexed_points(event, configuration::attributes::WHEEL_POSITION),
+        wheel_radii: decode_indexed_f32(event, configuration::attributes::WHEEL_RADIUS),
     }
 }
 
@@ -720,6 +735,30 @@ fn decode_indexed_bools(event: &ConfigurationEvent<'_>, attribute: Attribute<boo
         let Some(index) = scs_sdk_plugin::sdk::SdkIndex::new(i) else { break };
         let Some(value) = event.get_at(attribute, index) else { break };
         values.push(value);
+    }
+    values
+}
+
+/// Same contiguous-index approach as `decode_indexed_bools`, for an indexed
+/// float attribute (`wheel.radius`).
+fn decode_indexed_f32(event: &ConfigurationEvent<'_>, attribute: Attribute<f32>) -> Vec<f32> {
+    let mut values = Vec::new();
+    for i in 0..MAX_WHEEL_INDEX {
+        let Some(index) = scs_sdk_plugin::sdk::SdkIndex::new(i) else { break };
+        let Some(value) = event.get_at(attribute, index) else { break };
+        values.push(value);
+    }
+    values
+}
+
+/// Same contiguous-index approach as `decode_indexed_bools`, for an indexed
+/// vector attribute (`wheel.position`).
+fn decode_indexed_points(event: &ConfigurationEvent<'_>, attribute: Attribute<FVector>) -> Vec<LocalPoint> {
+    let mut values = Vec::new();
+    for i in 0..MAX_WHEEL_INDEX {
+        let Some(index) = scs_sdk_plugin::sdk::SdkIndex::new(i) else { break };
+        let Some(value) = event.get_at(attribute, index) else { break };
+        values.push(LocalPoint::from(value));
     }
     values
 }
